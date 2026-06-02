@@ -1,6 +1,6 @@
-//! Thin Telegram Bot API client — only the two endpoints this
-//! adapter needs: `getUpdates` (long-poll inbound) and `sendMessage`
-//! (deliver outbound).
+//! Thin Telegram Bot API client — only the endpoints this adapter
+//! needs: `getUpdates` (long-poll inbound), `sendMessage` (deliver
+//! outbound), and `sendChatAction` (typing indicator).
 //!
 //! Reference: <https://core.telegram.org/bots/api>. Bot tokens look
 //! like `<bot_id>:<random>`; the API base is
@@ -125,6 +125,17 @@ impl Telegram {
             "https://api.telegram.org/file/{}/{file_path}",
             self.base.trim_start_matches("https://api.telegram.org/")
         )
+    }
+
+    /// Send a "typing" chat action. The indicator lasts ~5 seconds on
+    /// the client side or until a message is sent (whichever comes first).
+    /// Best-effort — failures are logged but not propagated.
+    pub async fn send_typing(&self, chat_id: i64) {
+        let url = format!("{}/sendChatAction", self.base);
+        let body = serde_json::json!({ "chat_id": chat_id, "action": "typing" });
+        if let Err(e) = self.http.post(&url).json(&body).send().await {
+            tracing::debug!(error = %e, "sendChatAction failed (non-fatal)");
+        }
     }
 
     /// Send a plain text message. `reply_to_message_id` threads under
