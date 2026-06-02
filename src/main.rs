@@ -155,15 +155,24 @@ async fn telegram_inbound_loop(
         };
         for update in updates {
             offset = update.update_id + 1;
-            let chat_id = update.message.as_ref().map(|m| m.chat.id);
-            if let Some(frame) = translate_update(&update, &tg, whisper.as_ref(), &account_id, &seq).await
-                && outbound_tx.send(frame).await.is_err()
+            let chat_id = update
+                .message
+                .as_ref()
+                .filter(|m| m.chat.kind == "private")
+                .map(|m| m.chat.id);
+            // Fire typing indicator before translate (which may do STT).
+            // Spawned fire-and-forget so it never blocks the inbound loop.
+            // Only for private chats — group messages are dropped by translate_update.
+            if let Some(cid) = chat_id {
+                let tg_c = tg.clone();
+                tokio::spawn(async move { tg_c.send_typing(cid).await });
+            }
+            let frame = translate_update(&update, &tg, whisper.as_ref(), &account_id, &seq).await;
+            if let Some(f) = frame
+                && outbound_tx.send(f).await.is_err()
             {
                 info!("outbound channel closed; telegram inbound loop exiting");
                 return Ok(());
-            }
-            if let Some(cid) = chat_id {
-                tg.send_typing(cid).await;
             }
         }
     }
