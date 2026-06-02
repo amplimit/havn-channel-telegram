@@ -155,11 +155,15 @@ async fn telegram_inbound_loop(
         };
         for update in updates {
             offset = update.update_id + 1;
+            let chat_id = update.message.as_ref().map(|m| m.chat.id);
             if let Some(frame) = translate_update(&update, &tg, whisper.as_ref(), &account_id, &seq).await
                 && outbound_tx.send(frame).await.is_err()
             {
                 info!("outbound channel closed; telegram inbound loop exiting");
                 return Ok(());
+            }
+            if let Some(cid) = chat_id {
+                tg.send_typing(cid).await;
             }
         }
     }
