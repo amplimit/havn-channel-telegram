@@ -1,0 +1,14 @@
+# Copy this file to /etc/havn-channel-telegram/config.toml and fill in
+# real values. See README.md for details.
+
+bot_token            = "YOUR_TELEGRAM_BOT_TOKEN"
+havn_gateway         = "ws://127.0.0.1:8100"
+adapter_token        = "YOUR_ADAPTER_TOKEN"
+channel_id           = "telegram"
+account_id           = "my-tg-bot"
+poll_timeout_seconds = 25
+
+# Optional: Whisper STT for voice messages.
+# openai_api_key   = "YOUR_WHISPER_API_KEY"
+# whisper_base_url = "https://api.groq.com/openai/v1"
+# whisper_model    = "whisper-large-v3-turbo"

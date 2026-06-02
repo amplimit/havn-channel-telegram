@@ -1,0 +1,6 @@
+target/
+*.log
+config.toml
+.env
+*.db
+.claude/
