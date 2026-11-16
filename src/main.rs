@@ -440,8 +440,25 @@ async fn havn_outbound_loop(
     gateway: Gateway,
     mut inbound_rx: tokio::sync::mpsc::Receiver<ChannelFrame>,
 ) -> Result<()> {
+    // The menu last set, so a reconnect does not set it again.
+    let mut menu: Option<Vec<types::ChannelCommand>> = None;
     while let Some(frame) = inbound_rx.recv().await {
         match frame {
+            ChannelFrame::Commands(c) => {
+                if menu.as_ref() == Some(&c.commands) {
+                    continue;
+                }
+                match tg.set_my_commands(&c.commands).await {
+                    Ok(n) => {
+                        info!(commands = n, "telegram command menu set");
+                        menu = Some(c.commands);
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "telegram setMyCommands failed; the menu stays as it was"
+                    ),
+                }
+            }
             ChannelFrame::Outbound(o) => {
                 if let Err(e) = deliver_outbound(&tg, &gateway, &o).await {
                     warn!(error = %e, seq = o.seq, "telegram sendMessage failed; dropping");

@@ -20,6 +20,22 @@ pub enum ChannelFrame {
     Resume(ChannelResume),
     Ping,
     Pong,
+    /// Gateway -> adapter: the chat commands the gateway answers, for
+    /// the bot's command menu.
+    Commands(ChannelCommands),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelCommands {
+    pub account_id: String,
+    pub commands: Vec<ChannelCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelCommand {
+    /// Without the slash.
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
