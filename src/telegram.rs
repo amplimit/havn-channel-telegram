@@ -229,6 +229,57 @@ impl Telegram {
     }
 }
 
+impl Telegram {
+    /// Set the bot's command menu (`setMyCommands`) to `commands`: those
+    /// Telegram takes (a name of 1-32 lowercase letters, digits and `_`,
+    /// a description of 1-256 characters), at most 100. How many were set.
+    pub async fn set_my_commands(
+        &self,
+        commands: &[crate::types::ChannelCommand],
+    ) -> Result<usize> {
+        let menu = menu_entries(commands);
+        let url = format!("{}/setMyCommands", self.base);
+        let body = serde_json::json!({ "commands": menu });
+        let resp: ApiResponse<serde_json::Value> = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("setMyCommands request")?
+            .json()
+            .await
+            .context("setMyCommands body parse")?;
+        if !resp.ok {
+            anyhow::bail!(
+                "telegram setMyCommands returned ok=false: {}",
+                resp.description.unwrap_or_default()
+            );
+        }
+        Ok(menu.len())
+    }
+}
+
+/// The entries of `commands` Telegram's menu takes, as it takes them.
+fn menu_entries(commands: &[crate::types::ChannelCommand]) -> Vec<serde_json::Value> {
+    commands
+        .iter()
+        .filter(|c| {
+            (1..=32).contains(&c.name.len())
+                && c.name
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .filter_map(|c| {
+            let description: String = c.description.trim().chars().take(256).collect();
+            (!description.is_empty())
+                .then(|| serde_json::json!({ "command": c.name, "description": description }))
+        })
+        .take(100)
+        .collect()
+}
+
 /// `caption` cut to the 1024 UTF-16 units Telegram keeps of one.
 fn caption_cut(caption: &str) -> String {
     let mut units = 0;
@@ -368,6 +419,31 @@ pub struct Chat {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_menu_keeps_what_telegram_takes() {
+        let c = |name: &str, description: &str| crate::types::ChannelCommand {
+            name: name.into(),
+            description: description.into(),
+        };
+        let long = "x".repeat(300);
+        let entries = super::menu_entries(&[
+            c("new", "Start a new chat"),
+            c("agent_model", &long),
+            c("Bad", "uppercase"),
+            c("agent-model", "hyphen"),
+            c("empty", "  "),
+            c(&"a".repeat(33), "too long"),
+        ]);
+        let names: Vec<_> = entries
+            .iter()
+            .map(|e| e["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["new", "agent_model"]);
+        assert_eq!(entries[1]["description"].as_str().unwrap().len(), 256);
+        let many: Vec<_> = (0..150).map(|i| c(&format!("c{i}"), "d")).collect();
+        assert_eq!(super::menu_entries(&many).len(), 100);
+    }
+
     use super::*;
 
     #[test]
