@@ -79,10 +79,10 @@ fn default_poll_timeout() -> u64 {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Self =
-            toml::from_str(&raw).with_context(|| format!("parsing {} as TOML", path.display()))?;
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let cfg: Self = toml::from_str(&raw)
+            .with_context(|| format!("parsing {} as TOML", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }

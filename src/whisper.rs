@@ -73,7 +73,10 @@ impl Whisper {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("whisper returned {status}: {body}");
         }
-        let parsed: TranscriptionResponse = resp.json().await.context("parse whisper response")?;
+        let parsed: TranscriptionResponse = resp
+            .json()
+            .await
+            .context("parse whisper response")?;
         Ok(parsed.text)
     }
 }
