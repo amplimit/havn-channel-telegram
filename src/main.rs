@@ -353,14 +353,21 @@ fn file_message(
 /// What kept a file from the agent, for the message to say.
 fn failure(e: &anyhow::Error) -> &'static str {
     let chain = format!("{e:#}");
-    if chain.contains("larger than") {
+    // The gateway's reasons first: several share a status.
+    if chain.contains("inbox is full") {
+        "the agent's inbox is full"
+    } else if chain.contains("disk space") {
+        "the agent's host is out of disk space"
+    } else if chain.contains("in the last hour") {
+        "this sender sent too many files in the last hour"
+    } else if chain.contains("file is too big") {
+        "it is larger than the 20 MB Telegram lets bots download"
+    } else if chain.contains("larger than") || chain.contains("over 25 MB") {
         "it is larger than 25 MB"
     } else if chain.contains("(403") {
         "the agent does not take files from this sender"
-    } else if chain.contains("(409") {
+    } else if chain.contains("still running") {
         "too many files at once; it can be sent again in a while"
-    } else if chain.contains("(507") || chain.contains("inbox is full") {
-        "the agent's inbox is full"
     } else {
         "it could not be downloaded from Telegram or saved"
     }
@@ -569,6 +576,34 @@ fn parse_message_id(s: &str) -> Option<i64> {
         return None;
     }
     msg_id_str.parse().ok()
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn each_refusal_says_what_it_is() {
+        let say = |text: &str| failure(&anyhow::anyhow!(text.to_string()));
+        assert_eq!(
+            say("havn refused the file (409 Conflict): the agent's inbox is full; remove files"),
+            "the agent's inbox is full"
+        );
+        assert_eq!(
+            say("havn refused the file (409 Conflict): 2 uploads of yours are still running"),
+            "too many files at once; it can be sent again in a while"
+        );
+        assert_eq!(
+            say(
+                "telegram getFile: telegram getFile returned ok=false: Bad Request: file is too big"
+            ),
+            "it is larger than the 20 MB Telegram lets bots download"
+        );
+        assert_eq!(
+            say("connection reset"),
+            "it could not be downloaded from Telegram or saved"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -79,9 +79,11 @@ impl Gateway {
         url.query_pairs_mut()
             .append_pair("sender", sender)
             .append_pair("name", name);
-        // The account's uploads at once are few: a 409 waits a moment.
+        let bytes = bytes::Bytes::from(bytes);
+        // The account's uploads at once are few: when they are all
+        // running, the file waits a moment. No other refusal passes soon.
         let mut attempt = 0;
-        let resp = loop {
+        let (status, body) = loop {
             attempt += 1;
             let resp = self
                 .http
@@ -93,20 +95,23 @@ impl Gateway {
                 .send()
                 .await
                 .context("sending the file to havn")?;
-            if resp.status() != reqwest::StatusCode::CONFLICT || attempt == 3 {
-                break resp;
+            let status = resp.status();
+            if status.is_success() {
+                return resp.json().await.context("havn's answer to the file");
+            }
+            let body = resp.text().await.unwrap_or_default();
+            if status != reqwest::StatusCode::CONFLICT
+                || !body.contains("still running")
+                || attempt == 3
+            {
+                break (status, body);
             }
             tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
         };
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "havn refused the file ({status}): {}",
-                body.chars().take(200).collect::<String>()
-            );
-        }
-        resp.json().await.context("havn's answer to the file")
+        bail!(
+            "havn refused the file ({status}): {}",
+            body.chars().take(200).collect::<String>()
+        );
     }
 
     /// The bytes of a file an agent sent, at `path` as its outbound `File`

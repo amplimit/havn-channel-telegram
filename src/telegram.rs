@@ -15,11 +15,20 @@
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Telegram {
     base: String,
     http: reqwest::Client,
     poll_timeout_seconds: u64,
+}
+
+// By hand: `base` holds the bot token.
+impl std::fmt::Debug for Telegram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telegram")
+            .field("poll_timeout_seconds", &self.poll_timeout_seconds)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Telegram {
