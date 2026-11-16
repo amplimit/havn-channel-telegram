@@ -20,14 +20,16 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod gateway;
 mod havn_ws;
 mod telegram;
 mod types;
 mod whisper;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -35,9 +37,12 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::gateway::Gateway;
 use crate::havn_ws::{WsClient, WsConfig};
 use crate::telegram::{Telegram, Update};
-use crate::types::{ChannelFrame, ChannelInbound, ChannelMessageContent, ChannelOutbound};
+use crate::types::{
+    Attachment, ChannelFrame, ChannelInbound, ChannelMessageContent, ChannelOutbound,
+};
 use crate::whisper::Whisper;
 
 #[derive(Debug, Parser)]
@@ -50,7 +55,11 @@ struct Cli {
     /// Path to the daemon's TOML config file. See README for the
     /// schema. Defaults to /etc/havn-channel-telegram/config.toml
     /// for system installs; ./config.toml otherwise.
-    #[arg(long, env = "HAVN_TG_CONFIG", default_value = "/etc/havn-channel-telegram/config.toml")]
+    #[arg(
+        long,
+        env = "HAVN_TG_CONFIG",
+        default_value = "/etc/havn-channel-telegram/config.toml"
+    )]
     config: PathBuf,
 }
 
@@ -58,9 +67,8 @@ struct Cli {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    let cfg = Config::load(&cli.config).with_context(|| {
-        format!("loading config from {}", cli.config.display())
-    })?;
+    let cfg = Config::load(&cli.config)
+        .with_context(|| format!("loading config from {}", cli.config.display()))?;
     info!(
         config = %cli.config.display(),
         gateway = %cfg.havn_gateway,
@@ -69,24 +77,29 @@ async fn main() -> Result<()> {
         "havn-channel-telegram starting"
     );
 
-    let telegram = Telegram::new(&cfg.bot_token, cfg.poll_timeout_seconds)
-        .context("Telegram client init")?;
+    let telegram =
+        Telegram::new(&cfg.bot_token, cfg.poll_timeout_seconds).context("Telegram client init")?;
     let whisper = match cfg.openai_api_key.as_ref() {
-        Some(k) if !k.is_empty() => {
-            Some(
-                Whisper::new(
-                    k.clone(),
-                    cfg.whisper_base_url.clone(),
-                    cfg.whisper_model.clone(),
-                )
-                .context("Whisper init")?,
+        Some(k) if !k.is_empty() => Some(
+            Whisper::new(
+                k.clone(),
+                cfg.whisper_base_url.clone(),
+                cfg.whisper_model.clone(),
             )
-        }
+            .context("Whisper init")?,
+        ),
         _ => {
             info!("no openai_api_key configured — voice messages will be dropped");
             None
         }
     };
+    let gateway = Gateway::new(
+        &cfg.havn_gateway,
+        &cfg.adapter_token,
+        &cfg.channel_id,
+        &cfg.account_id,
+    )
+    .context("havn gateway client init")?;
     let ws = WsClient::spawn(WsConfig {
         gateway_url: cfg.havn_gateway.clone(),
         adapter_token: cfg.adapter_token.clone(),
@@ -106,10 +119,11 @@ async fn main() -> Result<()> {
     let inbound_task = tokio::spawn(telegram_inbound_loop(
         telegram.clone(),
         whisper.clone(),
+        gateway.clone(),
         outbound_tx.clone(),
         cfg.account_id.clone(),
     ));
-    let outbound_task = tokio::spawn(havn_outbound_loop(telegram.clone(), inbound_rx));
+    let outbound_task = tokio::spawn(havn_outbound_loop(telegram.clone(), gateway, inbound_rx));
 
     // Wait for shutdown signal. Dropping `outbound_tx` triggers
     // graceful WS close + connection_loop exit.
@@ -139,6 +153,7 @@ fn init_tracing() {
 async fn telegram_inbound_loop(
     tg: Telegram,
     whisper: Option<Whisper>,
+    gateway: Gateway,
     outbound_tx: tokio::sync::mpsc::Sender<ChannelFrame>,
     account_id: String,
 ) -> Result<()> {
@@ -167,7 +182,8 @@ async fn telegram_inbound_loop(
                 let tg_c = tg.clone();
                 tokio::spawn(async move { tg_c.send_typing(cid).await });
             }
-            let frame = translate_update(&update, &tg, whisper.as_ref(), &account_id, &seq).await;
+            let frame =
+                translate_update(&update, &tg, whisper.as_ref(), &gateway, &account_id, &seq).await;
             if let Some(f) = frame
                 && outbound_tx.send(f).await.is_err()
             {
@@ -182,6 +198,7 @@ async fn translate_update(
     update: &Update,
     tg: &Telegram,
     whisper: Option<&Whisper>,
+    gateway: &Gateway,
     account_id: &str,
     seq: &Arc<AtomicU64>,
 ) -> Option<ChannelFrame> {
@@ -196,8 +213,9 @@ async fn translate_update(
     }
     let from = msg.from.as_ref()?;
 
-    let timestamp = chrono::DateTime::from_timestamp(msg.date, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let timestamp = chrono::DateTime::from_timestamp(msg.date, 0).unwrap_or_else(chrono::Utc::now);
+    let sender_id = format!("tg:{}", from.id);
+    let mut attachments = Vec::new();
 
     // Dispatch by content shape. Telegram messages are mutually
     // exclusive between text / voice / location / contact at the
@@ -233,8 +251,39 @@ async fn translate_update(
         }
     } else if let Some(text) = &msg.text {
         ChannelMessageContent::Text { text: text.clone() }
+    } else if let Some(sizes) = &msg.photo {
+        // The largest of the sizes Telegram keeps.
+        let best = sizes
+            .iter()
+            .max_by_key(|p| u64::from(p.width) * u64::from(p.height))?;
+        let received = receive_file(
+            tg,
+            gateway,
+            &sender_id,
+            &best.file_id,
+            "photo.jpg",
+            "image/jpeg",
+        )
+        .await;
+        file_message(
+            received,
+            msg.caption.as_deref(),
+            "photo.jpg",
+            &mut attachments,
+        )
+    } else if let Some(doc) = &msg.document {
+        let name = doc.file_name.as_deref().unwrap_or("file");
+        let media_type = doc
+            .mime_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let received = receive_file(tg, gateway, &sender_id, &doc.file_id, name, media_type).await;
+        file_message(received, msg.caption.as_deref(), name, &mut attachments)
     } else {
-        debug!(message_id = msg.message_id, "dropping unsupported message variant");
+        debug!(
+            message_id = msg.message_id,
+            "dropping unsupported message variant"
+        );
         return None;
     };
 
@@ -242,15 +291,61 @@ async fn translate_update(
         seq: seq.fetch_add(1, Ordering::Relaxed),
         account_id: account_id.to_string(),
         channel_message_id: format!("tg:chat:{}:msg:{}", msg.chat.id, msg.message_id),
-        sender_id: format!("tg:{}", from.id),
+        sender_id,
         content,
         timestamp,
         // Stash the original payload for audit and so the agent can
         // inspect telegram-specific bits (username, first_name,
         // forward_from, …) if a future skill teaches it to.
         raw: serde_json::to_value(msg).ok(),
+        attachments,
     };
     Some(ChannelFrame::Inbound(inbound))
+}
+
+/// Download a file the sender sent from Telegram and give it to the
+/// gateway; the attachment their message names.
+async fn receive_file(
+    tg: &Telegram,
+    gateway: &Gateway,
+    sender_id: &str,
+    file_id: &str,
+    name: &str,
+    media_type: &str,
+) -> Result<Attachment> {
+    let file_path = tg.get_file(file_id).await.context("telegram getFile")?;
+    let bytes = tg
+        .download_file(&file_path)
+        .await
+        .context("downloading from telegram")?;
+    gateway.upload(sender_id, name, media_type, bytes).await
+}
+
+/// The text of a message that sent file `name`: its caption, and when the
+/// file could not be passed on, a line saying so, for the agent to tell
+/// the sender.
+fn file_message(
+    received: Result<Attachment>,
+    caption: Option<&str>,
+    name: &str,
+    attachments: &mut Vec<Attachment>,
+) -> ChannelMessageContent {
+    let mut text = caption.unwrap_or_default().to_string();
+    match received {
+        Ok(attachment) => attachments.push(attachment),
+        Err(e) => {
+            warn!(name, error = %format!("{e:#}"), "could not pass a file on to havn");
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            let _ = write!(
+                text,
+                "[The sender sent a file, {name}, that could not be received: {}]",
+                format!("{e:#}").chars().take(200).collect::<String>()
+            );
+        }
+    }
+    ChannelMessageContent::Text { text }
 }
 
 /// Translate a Telegram voice message into a `ChannelMessageContent::
@@ -303,10 +398,11 @@ async fn translate_voice(
         transcript_len = transcript.len(),
         "telegram voice → whisper transcript"
     );
+    // Not the file's URL: it holds the bot token.
     Some(ChannelMessageContent::Audio {
         transcript,
         duration_seconds: Some(voice.duration),
-        url: Some(tg.public_file_url(&file_path)),
+        url: None,
     })
 }
 
@@ -316,12 +412,13 @@ async fn translate_voice(
 /// Resume) are logged and dropped.
 async fn havn_outbound_loop(
     tg: Telegram,
+    gateway: Gateway,
     mut inbound_rx: tokio::sync::mpsc::Receiver<ChannelFrame>,
 ) -> Result<()> {
     while let Some(frame) = inbound_rx.recv().await {
         match frame {
             ChannelFrame::Outbound(o) => {
-                if let Err(e) = deliver_outbound(&tg, &o).await {
+                if let Err(e) = deliver_outbound(&tg, &gateway, &o).await {
                     warn!(error = %e, seq = o.seq, "telegram sendMessage failed; dropping");
                 }
             }
@@ -345,16 +442,13 @@ async fn havn_outbound_loop(
     Ok(())
 }
 
-async fn deliver_outbound(tg: &Telegram, o: &ChannelOutbound) -> Result<()> {
+async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound) -> Result<()> {
     // Parse `to` (`tg:<chat_id>`).
-    let chat_id: i64 = o
-        .to
-        .strip_prefix("tg:")
-        .ok_or_else(|| {
-            anyhow::anyhow!("outbound `to` not in tg:<id> format: {:?}", o.to)
-        })?
-        .parse()
-        .with_context(|| format!("parse chat_id from {:?}", o.to))?;
+    let chat_id: i64 =
+        o.to.strip_prefix("tg:")
+            .ok_or_else(|| anyhow::anyhow!("outbound `to` not in tg:<id> format: {:?}", o.to))?
+            .parse()
+            .with_context(|| format!("parse chat_id from {:?}", o.to))?;
 
     let reply_to_message_id = o.in_reply_to.as_deref().and_then(parse_message_id);
 
@@ -369,20 +463,47 @@ async fn deliver_outbound(tg: &Telegram, o: &ChannelOutbound) -> Result<()> {
                 None => format!("[image: {url}]"),
             }
         }
-        ChannelMessageContent::File { url, filename } => {
-            format!("[file: {filename}]\n{url}")
-        }
+        ChannelMessageContent::File {
+            url,
+            filename,
+            caption,
+        } => match gateway.fetch(url).await {
+            Ok(bytes) => {
+                return tg
+                    .send_document(
+                        chat_id,
+                        bytes,
+                        filename,
+                        caption.as_deref(),
+                        reply_to_message_id,
+                    )
+                    .await;
+            }
+            Err(e) => {
+                warn!(filename, error = %format!("{e:#}"), "could not fetch a file the agent sent");
+                format!("(A file, {filename}, could not be delivered.)")
+            }
+        },
         // Audio / Location / Contact outbound: agents would emit
         // these for symmetry, but Telegram has dedicated APIs
         // (sendVoice, sendLocation, sendContact). Until a real agent
         // emits one of these, flatten to a textual marker. Gateway-
         // side agent_socket also flattens before we get here, so
         // these arms are belt-and-braces.
-        ChannelMessageContent::Audio { transcript, duration_seconds, .. } => match duration_seconds {
+        ChannelMessageContent::Audio {
+            transcript,
+            duration_seconds,
+            ..
+        } => match duration_seconds {
             Some(d) => format!("[voice, {d}s] {transcript}"),
             None => format!("[voice] {transcript}"),
         },
-        ChannelMessageContent::Location { latitude, longitude, name, .. } => {
+        ChannelMessageContent::Location {
+            latitude,
+            longitude,
+            name,
+            ..
+        } => {
             let label = name.clone().unwrap_or_default();
             let coords = format!("{latitude:.6},{longitude:.6}");
             if label.is_empty() {
@@ -391,7 +512,11 @@ async fn deliver_outbound(tg: &Telegram, o: &ChannelOutbound) -> Result<()> {
                 format!("[location: {coords} ({label})]")
             }
         }
-        ChannelMessageContent::Contact { display_name, phone_number, .. } => match phone_number {
+        ChannelMessageContent::Contact {
+            display_name,
+            phone_number,
+            ..
+        } => match phone_number {
             Some(ph) => format!("[contact: {display_name} {ph}]"),
             None => format!("[contact: {display_name}]"),
         },
