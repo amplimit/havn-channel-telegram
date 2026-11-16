@@ -189,10 +189,17 @@ implementing the same protocol; havn-core stays unchanged.
 ## Limitations (v0.2)
 
 - **Group / supergroup / channel chats are dropped** with a debug log.
-- **Image / file content from agent replies is flattened to text**
-  (`[image: <url>]`). Telegram has dedicated `sendPhoto` / `sendDocument`
-  endpoints; we'll wire them when an agent emits non-text content in
-  practice.
+- **Files.** A photo (its largest size) or a document a user sends is
+  downloaded from Telegram and passed to the gateway's
+  `POST /api/v1/channel/files`, which saves it in the agent's inbox (and
+  reads the text of a PDF, Word document or spreadsheet); the message
+  then carries it, with its caption as text. A file the agent sends
+  with `send_file` is fetched from the gateway and posted with
+  `sendDocument`, with its caption. Telegram lets bots download files of
+  up to 20 MB; the gateway takes up to 25 MB. A file that cannot be
+  passed on is named in the message, so the agent can say so.
+- **Images in agent replies** that are not files the agent sent are
+  still flattened to text (`[image: <url>]`).
 - **Reconnect drops in-flight messages.** havn's outbound replay
   buffer (spec §3.2 — last 5 minutes per account) lands in a
   follow-up — Layer D2. Today, when the daemon reconnects after a

@@ -32,6 +32,21 @@ pub struct ChannelInbound {
     pub timestamp: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<serde_json::Value>,
+    /// Files the message carries, each first sent to the gateway's
+    /// `POST /api/v1/channel/files` (havn issue #106).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file saved in the agent's inbox, as the gateway answered its upload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Attachment {
+    pub path: String,
+    pub name: String,
+    pub media_type: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +77,14 @@ pub enum ChannelMessageContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },
+    /// Outbound, a file an agent sent: `url` is the gateway's
+    /// `/api/v1/channel/files/<agent>/<file>`, fetched with the adapter
+    /// token.
     File {
         url: String,
         filename: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
     },
     Audio {
         transcript: String,

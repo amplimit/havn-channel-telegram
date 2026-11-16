@@ -1,6 +1,8 @@
 //! Thin Telegram Bot API client — only the endpoints this adapter
-//! needs: `getUpdates` (long-poll inbound), `sendMessage` (deliver
-//! outbound), and `sendChatAction` (typing indicator).
+//! needs: `getUpdates` (long-poll inbound), `getFile` and the file
+//! download (voice, photos, documents), `sendMessage` and
+//! `sendDocument` (deliver outbound), and `sendChatAction` (typing
+//! indicator).
 //!
 //! Reference: <https://core.telegram.org/bots/api>. Bot tokens look
 //! like `<bot_id>:<random>`; the API base is
@@ -13,11 +15,20 @@
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Telegram {
     base: String,
     http: reqwest::Client,
     poll_timeout_seconds: u64,
+}
+
+// By hand: `base` holds the bot token.
+impl std::fmt::Debug for Telegram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telegram")
+            .field("poll_timeout_seconds", &self.poll_timeout_seconds)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Telegram {
@@ -54,6 +65,7 @@ impl Telegram {
             ])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("getUpdates request")?
             .json()
             .await
@@ -78,6 +90,7 @@ impl Telegram {
             .query(&[("file_id", file_id)])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("getFile request")?
             .json()
             .await
@@ -102,29 +115,66 @@ impl Telegram {
             // file URL replaces `bot<token>` with `file/bot<token>`.
             self.base.trim_start_matches("https://api.telegram.org/")
         );
-        let bytes = self
+        let mut resp = self
             .http
             .get(&url)
+            .timeout(std::time::Duration::from_secs(180))
             .send()
             .await
-            .context("download_file request")?
-            .bytes()
-            .await
-            .context("download_file body")?;
-        Ok(bytes.to_vec())
+            .map_err(reqwest::Error::without_url)
+            .context("download_file request")?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.context("download_file body")? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > crate::gateway::MAX_FILE_BYTES {
+                anyhow::bail!("the file is larger than the gateway takes");
+            }
+        }
+        Ok(bytes)
     }
 
-    /// Publicly-accessible URL for a Telegram-hosted file. Same shape
-    /// as `download_file`'s URL — emitted on the wire as `Audio.url`
-    /// so a future multimodal agent could re-fetch the original audio.
-    /// Telegram-hosted URLs expire after about 1 hour; callers should
-    /// not depend on long-term availability.
-    #[must_use]
-    pub fn public_file_url(&self, file_path: &str) -> String {
-        format!(
-            "https://api.telegram.org/file/{}/{file_path}",
-            self.base.trim_start_matches("https://api.telegram.org/")
-        )
+    /// Send a file as a document, with its caption (Telegram keeps 1024
+    /// characters of one).
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        bytes: Vec<u8>,
+        filename: &str,
+        caption: Option<&str>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
+        let url = format!("{}/sendDocument", self.base);
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_string());
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document", part);
+        if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
+            form = form.text("caption", caption_cut(caption));
+        }
+        if let Some(rt) = reply_to_message_id {
+            form = form
+                .text("reply_to_message_id", rt.to_string())
+                .text("allow_sending_without_reply", "true");
+        }
+        let resp: ApiResponse<serde_json::Value> = self
+            .http
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(180))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("sendDocument request")?
+            .json()
+            .await
+            .context("sendDocument body parse")?;
+        if !resp.ok {
+            anyhow::bail!(
+                "telegram sendDocument returned ok=false: {}",
+                resp.description.unwrap_or_default()
+            );
+        }
+        Ok(())
     }
 
     /// Send a "typing" chat action. The indicator lasts ~5 seconds on
@@ -134,7 +184,8 @@ impl Telegram {
         let url = format!("{}/sendChatAction", self.base);
         let body = serde_json::json!({ "chat_id": chat_id, "action": "typing" });
         if let Err(e) = self.http.post(&url).json(&body).send().await {
-            tracing::debug!(error = %e, "sendChatAction failed (non-fatal)");
+            // Its URL holds the bot token.
+            tracing::debug!(error = %e.without_url(), "sendChatAction failed (non-fatal)");
         }
     }
 
@@ -163,6 +214,7 @@ impl Telegram {
             .json(&body)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("sendMessage request")?
             .json()
             .await
@@ -175,6 +227,18 @@ impl Telegram {
         }
         Ok(())
     }
+}
+
+/// `caption` cut to the 1024 UTF-16 units Telegram keeps of one.
+fn caption_cut(caption: &str) -> String {
+    let mut units = 0;
+    caption
+        .chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= 1024
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +281,34 @@ pub struct Message {
     pub venue: Option<Venue>,
     #[serde(default)]
     pub contact: Option<Contact>,
+    /// The sizes of a photo, smallest first.
+    #[serde(default)]
+    pub photo: Option<Vec<PhotoSize>>,
+    #[serde(default)]
+    pub document: Option<Document>,
+    /// A photo's or document's caption.
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PhotoSize {
+    pub file_id: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Document {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -272,4 +364,18 @@ pub struct Chat {
     /// handles `private` (1:1 DM); others are dropped with a log.
     #[serde(rename = "type")]
     pub kind: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_caption_is_cut_by_what_telegram_counts() {
+        assert_eq!(caption_cut("short"), "short");
+        let wide = "\u{1F600}".repeat(600);
+        let cut = caption_cut(&wide);
+        assert_eq!(cut.encode_utf16().count(), 1024);
+        assert_eq!(cut.chars().count(), 512);
+    }
 }
