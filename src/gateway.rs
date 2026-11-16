@@ -79,15 +79,25 @@ impl Gateway {
         url.query_pairs_mut()
             .append_pair("sender", sender)
             .append_pair("name", name);
-        let resp = self
-            .http
-            .post(url)
-            .header(ADAPTER_TOKEN_HEADER, &self.token)
-            .header(CONTENT_TYPE, media_type)
-            .body(bytes)
-            .send()
-            .await
-            .context("sending the file to havn")?;
+        // The account's uploads at once are few: a 409 waits a moment.
+        let mut attempt = 0;
+        let resp = loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .post(url.clone())
+                .header(ADAPTER_TOKEN_HEADER, &self.token)
+                .header(CONTENT_TYPE, media_type)
+                .timeout(Duration::from_secs(110))
+                .body(bytes.clone())
+                .send()
+                .await
+                .context("sending the file to havn")?;
+            if resp.status() != reqwest::StatusCode::CONFLICT || attempt == 3 {
+                break resp;
+            }
+            tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+        };
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();

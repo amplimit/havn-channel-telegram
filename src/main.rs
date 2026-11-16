@@ -338,14 +338,32 @@ fn file_message(
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
+            // Only what went wrong, not the error itself: none of it may
+            // carry a URL with the bot token to the agent.
             let _ = write!(
                 text,
                 "[The sender sent a file, {name}, that could not be received: {}]",
-                format!("{e:#}").chars().take(200).collect::<String>()
+                failure(&e)
             );
         }
     }
     ChannelMessageContent::Text { text }
+}
+
+/// What kept a file from the agent, for the message to say.
+fn failure(e: &anyhow::Error) -> &'static str {
+    let chain = format!("{e:#}");
+    if chain.contains("larger than") {
+        "it is larger than 25 MB"
+    } else if chain.contains("(403") {
+        "the agent does not take files from this sender"
+    } else if chain.contains("(409") {
+        "too many files at once; it can be sent again in a while"
+    } else if chain.contains("(507") || chain.contains("inbox is full") {
+        "the agent's inbox is full"
+    } else {
+        "it could not be downloaded from Telegram or saved"
+    }
 }
 
 /// Translate a Telegram voice message into a `ChannelMessageContent::
@@ -469,7 +487,7 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
             caption,
         } => match gateway.fetch(url).await {
             Ok(bytes) => {
-                return tg
+                match tg
                     .send_document(
                         chat_id,
                         bytes,
@@ -477,7 +495,14 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
                         caption.as_deref(),
                         reply_to_message_id,
                     )
-                    .await;
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        warn!(filename, error = %format!("{e:#}"), "telegram sendDocument failed");
+                        format!("(A file, {filename}, could not be delivered.)")
+                    }
+                }
             }
             Err(e) => {
                 warn!(filename, error = %format!("{e:#}"), "could not fetch a file the agent sent");

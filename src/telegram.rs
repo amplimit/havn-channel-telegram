@@ -56,6 +56,7 @@ impl Telegram {
             ])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("getUpdates request")?
             .json()
             .await
@@ -80,6 +81,7 @@ impl Telegram {
             .query(&[("file_id", file_id)])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("getFile request")?
             .json()
             .await
@@ -110,6 +112,7 @@ impl Telegram {
             .timeout(std::time::Duration::from_secs(180))
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("download_file request")?;
         let mut bytes = Vec::new();
         while let Some(chunk) = resp.chunk().await.context("download_file body")? {
@@ -137,7 +140,7 @@ impl Telegram {
             .text("chat_id", chat_id.to_string())
             .part("document", part);
         if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
-            form = form.text("caption", caption.chars().take(1024).collect::<String>());
+            form = form.text("caption", caption_cut(caption));
         }
         if let Some(rt) = reply_to_message_id {
             form = form
@@ -151,6 +154,7 @@ impl Telegram {
             .multipart(form)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("sendDocument request")?
             .json()
             .await
@@ -171,7 +175,8 @@ impl Telegram {
         let url = format!("{}/sendChatAction", self.base);
         let body = serde_json::json!({ "chat_id": chat_id, "action": "typing" });
         if let Err(e) = self.http.post(&url).json(&body).send().await {
-            tracing::debug!(error = %e, "sendChatAction failed (non-fatal)");
+            // Its URL holds the bot token.
+            tracing::debug!(error = %e.without_url(), "sendChatAction failed (non-fatal)");
         }
     }
 
@@ -200,6 +205,7 @@ impl Telegram {
             .json(&body)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("sendMessage request")?
             .json()
             .await
@@ -212,6 +218,18 @@ impl Telegram {
         }
         Ok(())
     }
+}
+
+/// `caption` cut to the 1024 UTF-16 units Telegram keeps of one.
+fn caption_cut(caption: &str) -> String {
+    let mut units = 0;
+    caption
+        .chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= 1024
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,4 +355,18 @@ pub struct Chat {
     /// handles `private` (1:1 DM); others are dropped with a log.
     #[serde(rename = "type")]
     pub kind: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_caption_is_cut_by_what_telegram_counts() {
+        assert_eq!(caption_cut("short"), "short");
+        let wide = "\u{1F600}".repeat(600);
+        let cut = caption_cut(&wide);
+        assert_eq!(cut.encode_utf16().count(), 1024);
+        assert_eq!(cut.chars().count(), 512);
+    }
 }
