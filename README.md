@@ -7,11 +7,14 @@ It runs as its own process, apart from the gateway, and talks to it over the gat
 ## What it does
 
 - **Private chats** with the bot (1:1). Messages in groups, supergroups and channels are dropped.
-- **Text**, and **voice messages** transcribed with an OpenAI-compatible Whisper API when one is configured (otherwise, or when transcription fails, a voice message is dropped).
+- **Text**, and **voice messages** transcribed with an OpenAI-compatible Whisper API when one is configured; otherwise, or when transcription fails, the voice message reaches the agent as an audio file with a note saying why.
 - **Locations, venues and contacts**, passed to the agent as such.
-- **Files both ways.** A photo (its largest size) or a document someone sends is downloaded from Telegram and saved in the agent's inbox by the gateway, which also reads the text of a PDF, Word document or spreadsheet; the caption comes with it. A file the agent sends is posted with its caption. Telegram lets bots download files of up to 20 MB; the gateway takes up to 25 MB. A file that cannot be passed on is named in the message, so the agent can say so.
+- **Stickers** (their emoji and set) and **polls** (the question and options), as text.
+- **Files both ways.** A photo (its largest size), a document, a video, a video note, an audio file or an animation someone sends is downloaded from Telegram and saved in the agent's inbox by the gateway, which also reads the text of a PDF, Word document or spreadsheet; the caption comes with it. A file the agent sends is posted with its caption; a caption over Telegram's 1024 characters goes on in a message after the file. Telegram lets bots download files of up to 20 MB; the gateway takes up to 25 MB. A file that cannot be passed on is named in the message, so the agent can say so.
 - **A typing indicator** when a message arrives (Telegram shows it for about 5 seconds).
 - **The command menu.** The bot's `/` menu is set from the commands the gateway offers (`/new`, `/stop`, `/retry`, `/model`, ...), whenever the daemon connects.
+- **Long replies** are split into several messages at paragraph, line or word breaks, in order, under Telegram's 4096 characters each. When Telegram asks the bot to slow down, a part is sent again after the wait; if a part still cannot be sent, the person is told the rest did not come.
+- **Kinds it cannot pass on** (a dice roll, a game, a story, paid media, a checklist) reach the gateway as a note, so a sender who is not paired is answered and the agent can tell one who is. Service messages (a pin, a timer change) are ignored.
 - **Long polling** (`getUpdates`): no public address, domain or certificate is needed.
 
 Who may use the bot, what the commands do and how chats work is decided by the gateway: see [Channel Adapters](https://github.com/amplimit/havn#channel-adapters), [Chat commands](https://github.com/amplimit/havn#chat-commands) and [Invite codes](https://github.com/amplimit/havn#invite-codes) in the Havn README.
@@ -150,8 +153,8 @@ If it does not answer:
 ## Limitations
 
 - Private chats only; groups, supergroups and channels are dropped.
-- A reply longer than Telegram's 4096 characters is not split: Telegram refuses it and it is lost, with a warning in the daemon's log.
-- Stickers, videos and video notes, audio files, animations, polls and edited messages are dropped without an answer; send a video or audio as a file instead.
+- An edited message is not passed on: the agent answered the original, and acting on edits would repeat its work. Send a new message instead.
+- A voice message that cannot be downloaded from Telegram reaches the agent only as a note asking for it again.
 - Replies the agent sends while the daemon is disconnected from the gateway are lost: the gateway keeps them for 5 minutes, but this daemon does not ask for them yet when it reconnects.
 - Images in a reply that are not files the agent sent are shown as text (`[image: <url>]`).
 - Long polling only, no webhook.

@@ -222,7 +222,17 @@ async fn translate_update(
     // Bot API level (a single Update.message carries one); venue is
     // the only overlap (it includes both location and venue fields).
     let content = if let Some(voice) = &msg.voice {
-        translate_voice(tg, whisper, voice).await?
+        let caption = msg.caption.as_deref();
+        translate_voice(
+            tg,
+            whisper,
+            gateway,
+            &sender_id,
+            voice,
+            caption,
+            &mut attachments,
+        )
+        .await
     } else if let Some(venue) = &msg.venue {
         ChannelMessageContent::Location {
             latitude: venue.location.latitude,
@@ -251,40 +261,8 @@ async fn translate_update(
         }
     } else if let Some(text) = &msg.text {
         ChannelMessageContent::Text { text: text.clone() }
-    } else if let Some(sizes) = &msg.photo {
-        // The largest of the sizes Telegram keeps.
-        let best = sizes
-            .iter()
-            .max_by_key(|p| u64::from(p.width) * u64::from(p.height))?;
-        let received = receive_file(
-            tg,
-            gateway,
-            &sender_id,
-            &best.file_id,
-            "photo.jpg",
-            "image/jpeg",
-        )
-        .await;
-        file_message(
-            received,
-            msg.caption.as_deref(),
-            "photo.jpg",
-            &mut attachments,
-        )
-    } else if let Some(doc) = &msg.document {
-        let name = doc.file_name.as_deref().unwrap_or("file");
-        let media_type = doc
-            .mime_type
-            .as_deref()
-            .unwrap_or("application/octet-stream");
-        let received = receive_file(tg, gateway, &sender_id, &doc.file_id, name, media_type).await;
-        file_message(received, msg.caption.as_deref(), name, &mut attachments)
     } else {
-        debug!(
-            message_id = msg.message_id,
-            "dropping unsupported message variant"
-        );
-        return None;
+        media_content(msg, tg, gateway, &sender_id, &mut attachments).await?
     };
 
     let inbound = ChannelInbound {
@@ -301,6 +279,110 @@ async fn translate_update(
         attachments,
     };
     Some(ChannelFrame::Inbound(inbound))
+}
+
+/// A message that carries a file, a sticker, a poll or a kind of content
+/// this bot cannot pass on, for the agent; `None` for a service message
+/// (a pin, a timer change) that is no one's message to answer.
+async fn media_content(
+    msg: &telegram::Message,
+    tg: &Telegram,
+    gateway: &Gateway,
+    sender_id: &str,
+    attachments: &mut Vec<Attachment>,
+) -> Option<ChannelMessageContent> {
+    Some(if let Some(sizes) = &msg.photo {
+        // The largest of the sizes Telegram keeps.
+        let Some(best) = sizes
+            .iter()
+            .max_by_key(|p| u64::from(p.width) * u64::from(p.height))
+        else {
+            return Some(ChannelMessageContent::Text {
+                text: "[The sender sent a photo that could not be read.]".to_string(),
+            });
+        };
+        let received = receive_file(
+            tg,
+            gateway,
+            sender_id,
+            &best.file_id,
+            "photo.jpg",
+            "image/jpeg",
+        )
+        .await;
+        file_message(received, msg.caption.as_deref(), "photo.jpg", attachments)
+    } else if let Some(doc) = &msg.document {
+        // An animation (GIF) comes as a document too.
+        let name = doc.file_name.as_deref().unwrap_or("file");
+        let media_type = doc
+            .mime_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let received = receive_file(tg, gateway, sender_id, &doc.file_id, name, media_type).await;
+        file_message(received, msg.caption.as_deref(), name, attachments)
+    } else if let Some((media, name, media_type)) = media_file(msg) {
+        // A video, video note or audio file, passed on like a document.
+        let name = media.file_name.clone().unwrap_or_else(|| name.to_string());
+        let media_type = media.mime_type.as_deref().unwrap_or(media_type);
+        let received =
+            receive_file(tg, gateway, sender_id, &media.file_id, &name, media_type).await;
+        file_message(received, msg.caption.as_deref(), &name, attachments)
+    } else if let Some(sticker) = &msg.sticker {
+        ChannelMessageContent::Text {
+            text: sticker_text(sticker),
+        }
+    } else if let Some(poll) = &msg.poll {
+        ChannelMessageContent::Text {
+            text: poll_text(poll),
+        }
+    } else if msg.unsupported_content() {
+        // Not dropped silently: the gateway answers a sender who is not
+        // paired, and the agent can tell one who is.
+        debug!(
+            message_id = msg.message_id,
+            "passing on an unsupported message as a note"
+        );
+        ChannelMessageContent::Text {
+            text: "[The sender sent a kind of Telegram message this bot cannot pass on, \
+                   such as a game, a dice roll or a story. Ask them to send text or a file.]"
+                .to_string(),
+        }
+    } else {
+        debug!(message_id = msg.message_id, "ignoring a service message");
+        return None;
+    })
+}
+
+/// The video, video note or audio file `msg` carries, with the name and
+/// type to give it when Telegram gives none.
+fn media_file(
+    msg: &telegram::Message,
+) -> Option<(&telegram::MediaFile, &'static str, &'static str)> {
+    if let Some(v) = &msg.video {
+        return Some((v, "video.mp4", "video/mp4"));
+    }
+    if let Some(v) = &msg.video_note {
+        return Some((v, "video-note.mp4", "video/mp4"));
+    }
+    msg.audio.as_ref().map(|a| (a, "audio.mp3", "audio/mpeg"))
+}
+
+/// A sticker, for the agent: its emoji and set.
+fn sticker_text(sticker: &telegram::Sticker) -> String {
+    let emoji = sticker.emoji.as_deref().unwrap_or("?");
+    match &sticker.set_name {
+        Some(set) => format!("[sticker: {emoji}, from the set {set}]"),
+        None => format!("[sticker: {emoji}]"),
+    }
+}
+
+/// A poll, for the agent: its question and options.
+fn poll_text(poll: &telegram::Poll) -> String {
+    let mut text = format!("[poll: {}]", poll.question);
+    for option in &poll.options {
+        let _ = write!(text, "\n- {}", option.text);
+    }
+    text
 }
 
 /// Download a file the sender sent from Telegram and give it to the
@@ -373,62 +455,101 @@ fn failure(e: &anyhow::Error) -> &'static str {
     }
 }
 
-/// Translate a Telegram voice message into a `ChannelMessageContent::
-/// Audio` payload. Steps: resolve `file_id` → download OGG → Whisper
-/// STT → transcript. Returns None on any failure (operator sees a
-/// warn in the daemon log; user sees no agent reply, which is the
-/// signal that something's wrong).
+/// A Telegram voice message, for the agent: its transcript, through the
+/// Whisper API when one is configured; otherwise, or when transcription
+/// fails, the voice message itself as an audio file, with a note saying
+/// why. Never dropped.
 async fn translate_voice(
     tg: &Telegram,
     whisper: Option<&Whisper>,
+    gateway: &Gateway,
+    sender_id: &str,
     voice: &telegram::Voice,
-) -> Option<ChannelMessageContent> {
-    let Some(whisper) = whisper else {
-        warn!(
-            file_id = %voice.file_id,
-            "received voice message but no Whisper API configured (set openai_api_key); dropping"
-        );
-        return None;
+    caption: Option<&str>,
+    attachments: &mut Vec<Attachment>,
+) -> ChannelMessageContent {
+    let caption = caption.filter(|c| !c.trim().is_empty());
+    let audio = match tg.get_file(&voice.file_id).await {
+        Ok(path) => tg.download_file(&path).await,
+        Err(e) => Err(e),
     };
-    let file_path = match tg.get_file(&voice.file_id).await {
-        Ok(p) => p,
+    let audio = match audio {
+        Ok(bytes) => bytes,
         Err(e) => {
-            warn!(file_id = %voice.file_id, error = %e, "telegram getFile failed");
-            return None;
+            warn!(file_id = %voice.file_id, error = %format!("{e:#}"), "could not download a voice message");
+            return ChannelMessageContent::Text {
+                text: "[The sender sent a voice message that could not be downloaded. Ask them to \
+                       send it again, or as text.]"
+                    .to_string(),
+            };
         }
     };
-    let audio = match tg.download_file(&file_path).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(file_path, error = %e, "downloading voice from telegram failed");
-            return None;
-        }
+    let why = match whisper {
+        None => "no transcription is set up for this bot",
+        Some(whisper) => match whisper.transcribe(audio.clone(), "voice.ogg").await {
+            Ok(transcript) => {
+                debug!(
+                    duration = voice.duration,
+                    bytes = audio.len(),
+                    transcript_len = transcript.len(),
+                    "telegram voice → whisper transcript"
+                );
+                // Not the file's URL: it holds the bot token.
+                return ChannelMessageContent::Audio {
+                    transcript: match caption {
+                        Some(caption) => format!("{caption}\n\n{transcript}"),
+                        None => transcript,
+                    },
+                    duration_seconds: Some(voice.duration),
+                    url: None,
+                };
+            }
+            Err(e) => {
+                warn!(file_id = %voice.file_id, error = %format!("{e:#}"), "whisper transcription failed");
+                "it could not be transcribed"
+            }
+        },
     };
-    let bytes_len = audio.len();
-    let transcript = match whisper.transcribe(audio, "voice.ogg").await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(
-                file_id = %voice.file_id,
-                bytes = bytes_len,
-                error = %e,
-                "whisper transcription failed"
-            );
-            return None;
-        }
+    let received = gateway
+        .upload(sender_id, "voice.ogg", "audio/ogg", audio)
+        .await;
+    // Says "attached" only when it was; `file_message` adds why not.
+    let attached = if received.is_ok() {
+        ", attached as voice.ogg"
+    } else {
+        ""
     };
-    debug!(
-        duration = voice.duration,
-        bytes = bytes_len,
-        transcript_len = transcript.len(),
-        "telegram voice → whisper transcript"
+    let mut note = format!(
+        "[A voice message of {} seconds{attached}; {why}.]",
+        voice.duration
     );
-    // Not the file's URL: it holds the bot token.
-    Some(ChannelMessageContent::Audio {
-        transcript,
-        duration_seconds: Some(voice.duration),
-        url: None,
-    })
+    if let Some(caption) = caption {
+        note = format!("{caption}\n\n{note}");
+    }
+    file_message(received, Some(&note), "voice.ogg", attachments)
+}
+
+/// Send `text` to `chat_id`, in as many messages as Telegram's limit
+/// takes; the first replies to `reply_to`. When a part cannot be sent
+/// after the first, the person is told the rest did not come.
+async fn send_text(tg: &Telegram, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
+    let parts = telegram::split_text(text, telegram::MESSAGE_UNITS);
+    for (n, part) in parts.iter().enumerate() {
+        if let Err(e) = tg
+            .send_message(chat_id, part, if n == 0 { reply_to } else { None })
+            .await
+        {
+            if n > 0 {
+                let note = format!(
+                    "(The rest of this reply, {} more part(s), could not be delivered.)",
+                    parts.len() - n
+                );
+                let _ = tg.send_message(chat_id, &note, None).await;
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// havn → Telegram. Drain WS-received frames and translate each
@@ -511,17 +632,20 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
             caption,
         } => match gateway.fetch(url).await {
             Ok(bytes) => {
+                // What of the caption does not fit goes on after the file.
+                let (head, rest) = caption
+                    .as_deref()
+                    .map_or((String::new(), None), telegram::caption_parts);
                 match tg
-                    .send_document(
-                        chat_id,
-                        bytes,
-                        filename,
-                        caption.as_deref(),
-                        reply_to_message_id,
-                    )
+                    .send_document(chat_id, bytes, filename, Some(&head), reply_to_message_id)
                     .await
                 {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        if let Some(rest) = rest {
+                            send_text(tg, chat_id, &rest, None).await?;
+                        }
+                        return Ok(());
+                    }
                     Err(e) => {
                         warn!(filename, error = %format!("{e:#}"), "telegram sendDocument failed");
                         format!("(A file, {filename}, could not be delivered.)")
@@ -574,7 +698,7 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
         // when added.
     };
 
-    tg.send_message(chat_id, &text, reply_to_message_id).await
+    send_text(tg, chat_id, &text, reply_to_message_id).await
 }
 
 /// Parse a `channel_message_id` of the form `tg:chat:<chat>:msg:<msg>`
@@ -626,6 +750,20 @@ mod failure_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stickers_and_polls_reach_the_agent_as_text() {
+        let sticker = telegram::Sticker {
+            emoji: Some("x".into()),
+            set_name: Some("cats".into()),
+        };
+        assert_eq!(sticker_text(&sticker), "[sticker: x, from the set cats]");
+        let poll: telegram::Poll = serde_json::from_value(serde_json::json!({
+            "question": "Lunch?", "options": [{"text": "noodles"}, {"text": "rice"}]
+        }))
+        .expect("poll");
+        assert_eq!(poll_text(&poll), "[poll: Lunch?]\n- noodles\n- rice");
+    }
 
     #[test]
     fn parse_message_id_round_trip() {

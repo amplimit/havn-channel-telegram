@@ -122,7 +122,10 @@ impl Telegram {
             .send()
             .await
             .map_err(reqwest::Error::without_url)
-            .context("download_file request")?;
+            .context("download_file request")?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)
+            .context("download_file status")?;
         let mut bytes = Vec::new();
         while let Some(chunk) = resp.chunk().await.context("download_file body")? {
             bytes.extend_from_slice(&chunk);
@@ -149,7 +152,7 @@ impl Telegram {
             .text("chat_id", chat_id.to_string())
             .part("document", part);
         if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
-            form = form.text("caption", caption_cut(caption));
+            form = form.text("caption", caption.to_string());
         }
         if let Some(rt) = reply_to_message_id {
             form = form
@@ -208,24 +211,41 @@ impl Telegram {
             // a fresh message.
             body["allow_sending_without_reply"] = serde_json::json!(true);
         }
-        let resp: ApiResponse<serde_json::Value> = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context("sendMessage request")?
-            .json()
-            .await
-            .context("sendMessage body parse")?;
-        if !resp.ok {
-            anyhow::bail!(
-                "telegram sendMessage returned ok=false: {}",
-                resp.description.unwrap_or_default()
-            );
+        // Telegram limits how fast a bot writes to one chat; a long reply
+        // sent in parts can hit it, and it says how long to wait.
+        for tried in 1..=SEND_TRIES {
+            let resp: ApiResponse<serde_json::Value> = self
+                .http
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .context("sendMessage request")?
+                .json()
+                .await
+                .context("sendMessage body parse")?;
+            if resp.ok {
+                return Ok(());
+            }
+            match resp.parameters.and_then(|p| p.retry_after) {
+                Some(wait) if tried < SEND_TRIES => {
+                    tracing::info!(
+                        wait,
+                        "telegram asked to slow down; sending again after the wait"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        wait.min(MAX_RETRY_AFTER_SECONDS),
+                    ))
+                    .await;
+                }
+                _ => anyhow::bail!(
+                    "telegram sendMessage returned ok=false: {}",
+                    resp.description.unwrap_or_default()
+                ),
+            }
         }
-        Ok(())
+        anyhow::bail!("telegram sendMessage: still refused after {SEND_TRIES} tries")
     }
 }
 
@@ -280,16 +300,66 @@ fn menu_entries(commands: &[crate::types::ChannelCommand]) -> Vec<serde_json::Va
         .collect()
 }
 
-/// `caption` cut to the 1024 UTF-16 units Telegram keeps of one.
-fn caption_cut(caption: &str) -> String {
-    let mut units = 0;
-    caption
-        .chars()
-        .take_while(|c| {
+/// UTF-16 units Telegram takes in one message, and in one caption.
+pub const MESSAGE_UNITS: usize = 4096;
+pub const CAPTION_UNITS: usize = 1024;
+
+/// `text` in parts of at most `max` UTF-16 units (Telegram's measure),
+/// in order: each part ends at the last paragraph break in its second
+/// half, else the last line break, else the last space, else at `max`;
+/// a character is never split. The break between two parts is dropped
+/// (only the line breaks of a break at a line, so the next line keeps its
+/// indentation); a part that would be blank is left out.
+pub fn split_text(text: &str, max: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    loop {
+        // The byte where `max` units end, if the rest goes past it.
+        let mut units = 0;
+        let mut end = None;
+        for (at, c) in rest.char_indices() {
             units += c.len_utf16();
-            units <= 1024
-        })
-        .collect()
+            if units > max {
+                end = Some(at);
+                break;
+            }
+        }
+        let Some(end) = end else {
+            if !rest.trim().is_empty() {
+                parts.push(rest.trim_end().to_string());
+            }
+            return parts;
+        };
+        let window = &rest[..end];
+        let half = window.len() / 2;
+        let (cut, next, at_space) = ["\n\n", "\n", " "]
+            .iter()
+            .find_map(|sep| {
+                window
+                    .rfind(sep)
+                    .filter(|&at| at >= half && at > 0)
+                    .map(|at| (at, at + sep.len(), *sep == " "))
+            })
+            .unwrap_or((end, end, false));
+        let part = rest[..cut].trim_end();
+        if !part.is_empty() {
+            parts.push(part.to_string());
+        }
+        rest = if at_space {
+            rest[next..].trim_start_matches(' ')
+        } else {
+            rest[next..].trim_start_matches(['\n', '\r'])
+        };
+    }
+}
+
+/// `caption` as Telegram keeps it with a file: what fits, and the rest
+/// to send as messages after it.
+pub fn caption_parts(caption: &str) -> (String, Option<String>) {
+    let mut parts = split_text(caption, CAPTION_UNITS).into_iter();
+    let first = parts.next().unwrap_or_default();
+    let rest: Vec<String> = parts.collect();
+    (first, (!rest.is_empty()).then(|| rest.join("\n")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +369,21 @@ struct ApiResponse<T> {
     description: Option<String>,
     #[serde(default)]
     result: Option<T>,
+    /// For a 429: how long to wait before trying again.
+    #[serde(default)]
+    parameters: Option<ResponseParameters>,
 }
+
+#[derive(Debug, Deserialize, Default)]
+struct ResponseParameters {
+    #[serde(default)]
+    retry_after: Option<u64>,
+}
+
+/// Times a message is tried when Telegram asks the bot to slow down, and
+/// the longest wait it is given.
+const SEND_TRIES: usize = 3;
+const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
 #[derive(Debug, Deserialize)]
 pub struct Update {
@@ -340,6 +424,73 @@ pub struct Message {
     /// A photo's or document's caption.
     #[serde(default)]
     pub caption: Option<String>,
+    #[serde(default)]
+    pub video: Option<MediaFile>,
+    #[serde(default)]
+    pub video_note: Option<MediaFile>,
+    #[serde(default)]
+    pub audio: Option<MediaFile>,
+    #[serde(default)]
+    pub sticker: Option<Sticker>,
+    #[serde(default)]
+    pub poll: Option<Poll>,
+    /// Kinds of message a person sends on purpose that this bot cannot
+    /// pass on; their contents are not read.
+    #[serde(default)]
+    pub dice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub game: Option<serde_json::Value>,
+    #[serde(default)]
+    pub story: Option<serde_json::Value>,
+    #[serde(default)]
+    pub paid_media: Option<serde_json::Value>,
+    #[serde(default)]
+    pub checklist: Option<serde_json::Value>,
+}
+
+impl Message {
+    /// Whether it is a kind of message a person sent on purpose that this
+    /// bot cannot pass on (not a service message such as a pin).
+    #[must_use]
+    pub fn unsupported_content(&self) -> bool {
+        self.dice.is_some()
+            || self.game.is_some()
+            || self.story.is_some()
+            || self.paid_media.is_some()
+            || self.checklist.is_some()
+    }
+}
+
+/// A video, video note or audio file: what is needed to fetch it.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MediaFile {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Sticker {
+    #[serde(default)]
+    pub emoji: Option<String>,
+    #[serde(default)]
+    pub set_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Poll {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<PollOption>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PollOption {
+    pub text: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -444,14 +595,152 @@ mod tests {
         assert_eq!(super::menu_entries(&many).len(), 100);
     }
 
-    use super::*;
-
     #[test]
     fn a_caption_is_cut_by_what_telegram_counts() {
-        assert_eq!(caption_cut("short"), "short");
         let wide = "\u{1F600}".repeat(600);
-        let cut = caption_cut(&wide);
-        assert_eq!(cut.encode_utf16().count(), 1024);
-        assert_eq!(cut.chars().count(), 512);
+        let (first, rest) = super::caption_parts(&wide);
+        assert_eq!(first.encode_utf16().count(), 1024);
+        assert_eq!(first.chars().count(), 512);
+        assert_eq!(rest.expect("the rest").chars().count(), 88);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn units(s: &str) -> usize {
+        s.chars().map(char::len_utf16).sum()
+    }
+
+    #[test]
+    fn a_long_reply_is_split_whole_and_in_order() {
+        let para = "word ".repeat(199) + "end.";
+        let text = [para.as_str(); 10].join("\n\n");
+        let parts = split_text(&text, MESSAGE_UNITS);
+        assert_eq!(
+            parts.len(),
+            3,
+            "{:?}",
+            parts.iter().map(|p| units(p)).collect::<Vec<_>>()
+        );
+        assert!(parts.iter().all(|p| units(p) <= MESSAGE_UNITS));
+        assert!(
+            parts.iter().all(|p| p.ends_with("end.")),
+            "split at paragraph breaks"
+        );
+        assert_eq!(parts.join("\n\n"), text);
+    }
+
+    #[test]
+    fn chinese_and_emoji_stay_whole() {
+        let text = "季度收入增长了很多。".repeat(1000);
+        let parts = split_text(&text, MESSAGE_UNITS);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.concat(), text);
+        // An emoji is two UTF-16 units; a cut never splits one.
+        let emoji = "\u{1F600}".repeat(5000);
+        let parts = split_text(&emoji, MESSAGE_UNITS);
+        assert!(parts.iter().all(|p| units(p) <= MESSAGE_UNITS));
+        assert_eq!(parts.concat(), emoji);
+    }
+
+    #[test]
+    fn short_text_is_one_part_and_blank_text_none() {
+        assert_eq!(split_text("hi", MESSAGE_UNITS), ["hi"]);
+        assert_eq!(split_text("", MESSAGE_UNITS), Vec::<String>::new());
+        assert_eq!(
+            split_text(&"\r\n".repeat(5000), MESSAGE_UNITS),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn exactly_at_the_limit_is_one_part() {
+        assert_eq!(split_text(&"a".repeat(10), 10).len(), 1);
+        assert_eq!(
+            split_text(&"a".repeat(11), 10),
+            ["a".repeat(10), "a".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_line_after_a_cut_keeps_its_indentation() {
+        let code = format!("{}\n    indented()\n", "x".repeat(15));
+        let parts = split_text(&code, 20);
+        assert_eq!(parts, ["x".repeat(15), "    indented()".to_string()]);
+    }
+
+    #[test]
+    fn a_break_only_early_in_the_window_is_not_used() {
+        let text = format!("ab {}", "c".repeat(30));
+        let parts = split_text(&text, 20);
+        assert_eq!(parts[0].chars().count(), 20, "cut at the limit: {parts:?}");
+        assert_eq!(parts.concat(), text);
+    }
+
+    #[test]
+    fn leading_breaks_make_no_empty_part() {
+        let text = format!("\n\n\n{}", "word ".repeat(10));
+        let parts = split_text(&text, 20);
+        assert!(parts.iter().all(|p| !p.trim().is_empty()), "{parts:?}");
+    }
+
+    #[test]
+    fn a_wait_asked_for_is_read() {
+        let r: ApiResponse<serde_json::Value> = serde_json::from_value(serde_json::json!({
+            "ok": false, "error_code": 429, "description": "Too Many Requests: retry after 3",
+            "parameters": {"retry_after": 3}
+        }))
+        .expect("response");
+        assert_eq!(r.parameters.and_then(|p| p.retry_after), Some(3));
+    }
+
+    #[test]
+    fn a_long_caption_goes_on_after_the_file() {
+        let caption = "line\n".repeat(400);
+        let (first, rest) = caption_parts(&caption);
+        assert!(units(&first) <= CAPTION_UNITS);
+        let rest = rest.expect("the rest");
+        assert_eq!(format!("{first}\n{rest}").trim_end(), caption.trim_end());
+        assert_eq!(caption_parts("short"), ("short".to_string(), None));
+    }
+
+    #[test]
+    fn videos_audio_stickers_and_polls_are_read() {
+        let m: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"},
+            "video": {"file_id": "v", "mime_type": "video/mp4"},
+            "audio": {"file_id": "a", "file_name": "song.mp3"},
+            "sticker": {"emoji": "x", "set_name": "cats"},
+            "poll": {"question": "Lunch?", "options": [{"text": "yes"}, {"text": "no"}]}
+        }))
+        .expect("message");
+        assert_eq!(m.video.expect("video").file_id, "v");
+        assert_eq!(
+            m.audio.expect("audio").file_name.as_deref(),
+            Some("song.mp3")
+        );
+        assert_eq!(
+            m.sticker.expect("sticker").set_name.as_deref(),
+            Some("cats")
+        );
+        assert_eq!(m.poll.expect("poll").options.len(), 2);
+    }
+
+    #[test]
+    fn a_dice_roll_is_content_and_a_pin_is_not() {
+        let msg = |extra: serde_json::Value| -> Message {
+            let mut m = serde_json::json!({"message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"}});
+            m.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            serde_json::from_value(m).expect("message")
+        };
+        assert!(msg(serde_json::json!({"dice": {"emoji": "x", "value": 3}})).unsupported_content());
+        assert!(msg(serde_json::json!({"story": {"id": 1}})).unsupported_content());
+        assert!(
+            !msg(serde_json::json!({"pinned_message": {"message_id": 2}})).unsupported_content()
+        );
     }
 }
