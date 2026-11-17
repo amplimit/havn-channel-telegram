@@ -7,10 +7,10 @@ It runs as its own process, apart from the gateway, and talks to it over the gat
 ## What it does
 
 - **Private chats** with the bot (1:1). Messages in groups, supergroups and channels are dropped.
-- **Text**, and **voice messages** transcribed with an OpenAI-compatible Whisper API when one is configured (otherwise voice messages are dropped).
+- **Text**, and **voice messages** transcribed with an OpenAI-compatible Whisper API when one is configured (otherwise, or when transcription fails, a voice message is dropped).
 - **Locations, venues and contacts**, passed to the agent as such.
 - **Files both ways.** A photo (its largest size) or a document someone sends is downloaded from Telegram and saved in the agent's inbox by the gateway, which also reads the text of a PDF, Word document or spreadsheet; the caption comes with it. A file the agent sends is posted with its caption. Telegram lets bots download files of up to 20 MB; the gateway takes up to 25 MB. A file that cannot be passed on is named in the message, so the agent can say so.
-- **A typing indicator** while the agent works on a reply.
+- **A typing indicator** when a message arrives (Telegram shows it for about 5 seconds).
 - **The command menu.** The bot's `/` menu is set from the commands the gateway offers (`/new`, `/stop`, `/retry`, `/model`, ...), whenever the daemon connects.
 - **Long polling** (`getUpdates`): no public address, domain or certificate is needed.
 
@@ -44,7 +44,7 @@ account_id = "acme-bot"
 
 A sender id is `tg:` and the person's numeric Telegram user id (bots such as @userinfobot show it). Instead of listing everyone in `allow_from`, you can hand out one-time invite codes; see below.
 
-Changes to `[[channels]]` and `[[bindings]]` apply on `havn gateway restart` (or `systemctl restart havn`).
+Changes to `[[channels]]` and `[[bindings]]` apply when the gateway restarts: `systemctl restart havn` under the systemd unit, `havn gateway restart` for a gateway started with `havn gateway start`.
 
 ### 2. Give the gateway and the daemon a shared adapter token
 
@@ -123,7 +123,7 @@ sudo journalctl -u havn-channel-telegram -f
 
 ### 6. Let people in
 
-With `dm_policy = "allowlist"`, only senders in `allow_from` and senders admitted with an invite code may use the bot. Create a code on the gateway host and give it to the person; they send it to the bot once:
+With `dm_policy = "allowlist"`, only senders in `allow_from` and senders admitted with an invite code may use the bot. Create a code on the gateway host and give it to the person; they send it to the bot once. These commands open the gateway's database through the config of the user who runs them, so run them as the user the gateway runs as (root under the systemd unit: `sudo -i` first):
 
 ```bash
 havn invite create --channel telegram --account acme-bot              # expires in 24h
@@ -143,13 +143,15 @@ Then message the bot in Telegram; the bound agent answers, and typing `/` shows 
 
 If it does not answer:
 
-1. `havn doctor` checks the gateway; `havn agent list` shows whether the bound agent exists and runs.
+1. `havn doctor` checks the gateway; `havn agent list` shows whether the bound agent exists and runs (as the gateway's user, as above).
 2. In the daemon's log, a refused connection means the adapter token does not match the credential, or `channel_id` / `account_id` do not match an account in the gateway's config.
 3. In the gateway's log (`journalctl -u havn`), a message from a sender who is not allowed is refused there: add them to `allow_from` or give them an invite code.
 
 ## Limitations
 
 - Private chats only; groups, supergroups and channels are dropped.
+- A reply longer than Telegram's 4096 characters is not split: Telegram refuses it and it is lost, with a warning in the daemon's log.
+- Stickers, videos and video notes, audio files, animations, polls and edited messages are dropped without an answer; send a video or audio as a file instead.
 - Replies the agent sends while the daemon is disconnected from the gateway are lost: the gateway keeps them for 5 minutes, but this daemon does not ask for them yet when it reconnects.
 - Images in a reply that are not files the agent sent are shown as text (`[image: <url>]`).
 - Long polling only, no webhook.
