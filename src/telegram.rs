@@ -149,7 +149,7 @@ impl Telegram {
             .text("chat_id", chat_id.to_string())
             .part("document", part);
         if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
-            form = form.text("caption", caption_cut(caption));
+            form = form.text("caption", caption.to_string());
         }
         if let Some(rt) = reply_to_message_id {
             form = form
@@ -280,16 +280,60 @@ fn menu_entries(commands: &[crate::types::ChannelCommand]) -> Vec<serde_json::Va
         .collect()
 }
 
-/// `caption` cut to the 1024 UTF-16 units Telegram keeps of one.
-fn caption_cut(caption: &str) -> String {
-    let mut units = 0;
-    caption
-        .chars()
-        .take_while(|c| {
+/// UTF-16 units Telegram takes in one message, and in one caption.
+pub const MESSAGE_UNITS: usize = 4096;
+pub const CAPTION_UNITS: usize = 1024;
+
+/// `text` in parts of at most `max` UTF-16 units (Telegram's measure),
+/// in order: each part ends at the last paragraph break in its second
+/// half, else the last line break, else the last space, else at `max`;
+/// a character is never split. The breaks between parts are dropped.
+pub fn split_text(text: &str, max: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    loop {
+        // The byte where `max` units end, if the rest goes past it.
+        let mut units = 0;
+        let mut end = None;
+        for (at, c) in rest.char_indices() {
             units += c.len_utf16();
-            units <= 1024
-        })
-        .collect()
+            if units > max {
+                end = Some(at);
+                break;
+            }
+        }
+        let Some(end) = end else {
+            if !rest.trim().is_empty() || parts.is_empty() {
+                parts.push(rest.to_string());
+            }
+            return parts;
+        };
+        let window = &rest[..end];
+        let half = window.len() / 2;
+        let cut = ["\n\n", "\n", " "]
+            .iter()
+            .find_map(|sep| {
+                window
+                    .rfind(sep)
+                    .filter(|&at| at >= half && at > 0)
+                    .map(|at| (at, at + sep.len()))
+            })
+            .unwrap_or((end, end));
+        parts.push(rest[..cut.0].trim_end().to_string());
+        rest = rest[cut.1..].trim_start_matches(['\n', ' ']);
+        if rest.is_empty() {
+            return parts;
+        }
+    }
+}
+
+/// `caption` as Telegram keeps it with a file: what fits, and the rest
+/// to send as messages after it.
+pub fn caption_parts(caption: &str) -> (String, Option<String>) {
+    let mut parts = split_text(caption, CAPTION_UNITS).into_iter();
+    let first = parts.next().unwrap_or_default();
+    let rest: Vec<String> = parts.collect();
+    (first, (!rest.is_empty()).then(|| rest.join("\n")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +384,48 @@ pub struct Message {
     /// A photo's or document's caption.
     #[serde(default)]
     pub caption: Option<String>,
+    #[serde(default)]
+    pub video: Option<MediaFile>,
+    #[serde(default)]
+    pub video_note: Option<MediaFile>,
+    #[serde(default)]
+    pub audio: Option<MediaFile>,
+    #[serde(default)]
+    pub sticker: Option<Sticker>,
+    #[serde(default)]
+    pub poll: Option<Poll>,
+}
+
+/// A video, video note or audio file: what is needed to fetch it.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MediaFile {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Sticker {
+    #[serde(default)]
+    pub emoji: Option<String>,
+    #[serde(default)]
+    pub set_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Poll {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<PollOption>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PollOption {
+    pub text: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -444,14 +530,91 @@ mod tests {
         assert_eq!(super::menu_entries(&many).len(), 100);
     }
 
-    use super::*;
-
     #[test]
     fn a_caption_is_cut_by_what_telegram_counts() {
-        assert_eq!(caption_cut("short"), "short");
         let wide = "\u{1F600}".repeat(600);
-        let cut = caption_cut(&wide);
-        assert_eq!(cut.encode_utf16().count(), 1024);
-        assert_eq!(cut.chars().count(), 512);
+        let (first, rest) = super::caption_parts(&wide);
+        assert_eq!(first.encode_utf16().count(), 1024);
+        assert_eq!(first.chars().count(), 512);
+        assert_eq!(rest.expect("the rest").chars().count(), 88);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn units(s: &str) -> usize {
+        s.chars().map(char::len_utf16).sum()
+    }
+
+    #[test]
+    fn a_long_reply_is_split_whole_and_in_order() {
+        let para = "word ".repeat(199) + "end.";
+        let text = [para.as_str(); 10].join("\n\n");
+        let parts = split_text(&text, MESSAGE_UNITS);
+        assert_eq!(
+            parts.len(),
+            3,
+            "{:?}",
+            parts.iter().map(|p| units(p)).collect::<Vec<_>>()
+        );
+        assert!(parts.iter().all(|p| units(p) <= MESSAGE_UNITS));
+        assert!(
+            parts.iter().all(|p| p.ends_with("end.")),
+            "split at paragraph breaks"
+        );
+        assert_eq!(parts.join("\n\n"), text);
+    }
+
+    #[test]
+    fn chinese_and_emoji_stay_whole() {
+        let text = "季度收入增长了很多。".repeat(1000);
+        let parts = split_text(&text, MESSAGE_UNITS);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.concat(), text);
+        // An emoji is two UTF-16 units; a cut never splits one.
+        let emoji = "\u{1F600}".repeat(5000);
+        let parts = split_text(&emoji, MESSAGE_UNITS);
+        assert!(parts.iter().all(|p| units(p) <= MESSAGE_UNITS));
+        assert_eq!(parts.concat(), emoji);
+    }
+
+    #[test]
+    fn short_text_is_one_part() {
+        assert_eq!(split_text("hi", MESSAGE_UNITS), ["hi"]);
+        assert_eq!(split_text("", MESSAGE_UNITS), [""]);
+    }
+
+    #[test]
+    fn a_long_caption_goes_on_after_the_file() {
+        let caption = "line\n".repeat(400);
+        let (first, rest) = caption_parts(&caption);
+        assert!(units(&first) <= CAPTION_UNITS);
+        let rest = rest.expect("the rest");
+        assert_eq!(format!("{first}\n{rest}").trim_end(), caption.trim_end());
+        assert_eq!(caption_parts("short"), ("short".to_string(), None));
+    }
+
+    #[test]
+    fn videos_audio_stickers_and_polls_are_read() {
+        let m: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"},
+            "video": {"file_id": "v", "mime_type": "video/mp4"},
+            "audio": {"file_id": "a", "file_name": "song.mp3"},
+            "sticker": {"emoji": "x", "set_name": "cats"},
+            "poll": {"question": "Lunch?", "options": [{"text": "yes"}, {"text": "no"}]}
+        }))
+        .expect("message");
+        assert_eq!(m.video.expect("video").file_id, "v");
+        assert_eq!(
+            m.audio.expect("audio").file_name.as_deref(),
+            Some("song.mp3")
+        );
+        assert_eq!(
+            m.sticker.expect("sticker").set_name.as_deref(),
+            Some("cats")
+        );
+        assert_eq!(m.poll.expect("poll").options.len(), 2);
     }
 }
