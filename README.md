@@ -1,116 +1,110 @@
 # havn-channel-telegram
 
-Channel adapter daemon that bridges **Telegram Bot API** ↔ **havn's
-`/api/v1/channel` WebSocket protocol** ([spec §3](https://github.com/amplimit/havn/blob/main/platform-spec.md)).
-A user DMs a Telegram bot; havn agent replies. That's it.
+A daemon that connects a Telegram bot to a [Havn](https://github.com/amplimit/havn) gateway: people message the bot in Telegram, and the Havn agent bound to it answers there.
 
-This is an **external repo** — it doesn't depend on the havn workspace
-and ships independently. havn-core has zero Telegram-aware code; the
-adapter does the platform-specific translation in its own process,
-in its own trust zone (a compromised adapter daemon cannot read the
-gateway's credential store or escape into agent namespaces).
+It runs as its own process, apart from the gateway, and talks to it over the gateway's channel protocol (a WebSocket at `/api/v1/channel`). It holds the bot token and an adapter token; it cannot read the gateway's credentials or reach the agents. Stopping it stops the bot and nothing else.
 
-## What this is, what it isn't
+## What it does
 
-- ✅ A standalone Rust daemon. One config file, one binary, runs forever
-  reconnecting on transient failures.
-- ✅ Works with **any** Telegram bot you create via `@BotFather`. No
-  webhook setup required — uses long-poll `getUpdates`.
-- ✅ Bidirectional in v0.2: user → agent → user round-trips.
-- ❌ Not a havn-core feature. Removing this pack is `systemctl stop`
-  + `rm` of the binary; havn keeps running unaffected.
-- ❌ Not (yet) supporting Telegram groups, supergroups, or channels.
-  v0.2 is 1:1 DMs. Group-chat support adds member-disambiguation
-  semantics that don't fit cleanly into the (account, sender) model.
+- **Private chats** with the bot (1:1). Messages in groups, supergroups and channels are dropped.
+- **Text**, and **voice messages** transcribed with an OpenAI-compatible Whisper API when one is configured (otherwise voice messages are dropped).
+- **Locations, venues and contacts**, passed to the agent as such.
+- **Files both ways.** A photo (its largest size) or a document someone sends is downloaded from Telegram and saved in the agent's inbox by the gateway, which also reads the text of a PDF, Word document or spreadsheet; the caption comes with it. A file the agent sends is posted with its caption. Telegram lets bots download files of up to 20 MB; the gateway takes up to 25 MB. A file that cannot be passed on is named in the message, so the agent can say so.
+- **A typing indicator** while the agent works on a reply.
+- **The command menu.** The bot's `/` menu is set from the commands the gateway offers (`/new`, `/stop`, `/retry`, `/model`, ...), whenever the daemon connects.
+- **Long polling** (`getUpdates`): no public address, domain or certificate is needed.
 
-## Prerequisites
+Who may use the bot, what the commands do and how chats work is decided by the gateway: see [Channel Adapters](https://github.com/amplimit/havn#channel-adapters), [Chat commands](https://github.com/amplimit/havn#chat-commands) and [Invite codes](https://github.com/amplimit/havn#invite-codes) in the Havn README.
 
-1. A havn gateway running v0.8+ (channel API ships there). Verify
-   with `havn version` — must be ≥ 0.8.0.
-2. A Telegram bot. Create one with `@BotFather` (`/newbot`); save the
-   token (looks like `1234567890:AAH...`).
-3. havn config (`gateway.toml`) declaring the channel account:
+## Requirements
 
-   ```toml
-   [[channels.telegram.accounts]]
-   id                = "alice-tg-bot"
-   adapter_token_ref = "secret:channel:telegram:alice-tg-bot"
-   dm_policy         = "allowlist"   # or "open" / "owner_only"
-   allow_from        = ["tg:123456789"]   # your Telegram user id
+- A Havn gateway, 0.2.2 or later for the command menu (`havn --version`).
+- A Telegram bot: create one with [@BotFather](https://t.me/BotFather) (`/newbot`) and keep its token (`1234567890:AAH...`).
+- Rust, to build the daemon.
 
-   [[bindings]]
-   agent_id   = "<UUID of the havn agent that should answer DMs>"
-   channel    = "telegram"
-   account_id = "alice-tg-bot"
-   ```
+## Setup
 
-4. An adapter token in havn's credential store, stable across daemon
-   restarts:
+### 1. Declare the bot's account in the gateway
 
-   ```bash
-   # Generate a strong random token
-   ADAPTER_TOKEN="$(openssl rand -base64 32 | tr -d '\n')"
-   # Store it in havn (age-encrypted at rest)
-   havn credential add channel:telegram \
-       --name alice-tg-bot \
-       --token "$ADAPTER_TOKEN"
-   # Save the same token for the daemon's config (see below)
-   echo "$ADAPTER_TOKEN" > /etc/havn-channel-telegram/adapter-token
-   chmod 600 /etc/havn-channel-telegram/adapter-token
-   ```
+In the gateway's `config.toml` (`~/.config/havn/config.toml` for the user the gateway runs as, `/root/.config/havn/config.toml` under the systemd unit), add the account and bind it to an agent:
 
-## Install
+```toml
+[[channels.telegram.accounts]]
+id                = "acme-bot"
+adapter_token_ref = "secret:channel:telegram:acme-bot"
+dm_policy         = "allowlist"          # or "open": anyone who finds the bot
+allow_from        = ["tg:123456789"]     # Telegram user ids allowed to talk to it
+admins            = ["tg:123456789"]     # may use the admin commands (/model, /approve, ...)
+
+[[bindings]]
+agent_id   = "<id of the agent that answers, from `havn agent list`>"
+channel    = "telegram"
+account_id = "acme-bot"
+```
+
+A sender id is `tg:` and the person's numeric Telegram user id (bots such as @userinfobot show it). Instead of listing everyone in `allow_from`, you can hand out one-time invite codes; see below.
+
+Changes to `[[channels]]` and `[[bindings]]` apply on `havn gateway restart` (or `systemctl restart havn`).
+
+### 2. Give the gateway and the daemon a shared adapter token
 
 ```bash
-git clone https://github.com/amplimit/havn-channel-telegram /tmp/havn-channel-telegram
-cd /tmp/havn-channel-telegram
+ADAPTER_TOKEN="$(openssl rand -base64 32 | tr -d '\n')"
+havn credential add channel:telegram "$ADAPTER_TOKEN" --name acme-bot
+```
+
+The `--name` is the account id, so the gateway finds it as `secret:channel:telegram:acme-bot`. Keep the token for the daemon's config.
+
+### 3. Build and install the daemon
+
+```bash
+git clone https://github.com/amplimit/havn-channel-telegram
+cd havn-channel-telegram
 cargo build --release
 sudo install -m 755 target/release/havn-channel-telegram /usr/local/bin/
 ```
 
-## Config
+### 4. Configure the daemon
+
+Create a user for it, and its config readable by that user only (it holds both tokens):
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin havn-tg
+sudo install -d -m 755 /etc/havn-channel-telegram
+sudo install -m 600 -o havn-tg -g havn-tg config.example.toml /etc/havn-channel-telegram/config.toml
+sudoedit /etc/havn-channel-telegram/config.toml
+```
 
 ```toml
-# /etc/havn-channel-telegram/config.toml
-bot_token       = "1234567890:AAH..."     # from BotFather
-havn_gateway    = "ws://127.0.0.1:8100"   # or wss:// for TLS
-adapter_token   = "<paste the same token you ran `havn credential add` with>"
-channel_id      = "telegram"               # must match `[[channels.<channel_id>.accounts]]`
-account_id      = "alice-tg-bot"           # must match the account `id` above
+bot_token     = "1234567890:AAH..."         # from BotFather
+havn_gateway  = "ws://127.0.0.1:8080"       # the gateway's `listen` address; wss:// behind TLS
+adapter_token = "<the ADAPTER_TOKEN above>"
+channel_id    = "telegram"                  # as in [[channels.telegram.accounts]]
+account_id    = "acme-bot"                  # the account's id
 
-# Optional. Telegram allows up to 50; default 25.
+# Seconds Telegram holds a long poll open (at most 50; default 25).
 poll_timeout_seconds = 25
+
+# Voice messages, transcribed with an OpenAI-compatible Whisper API.
+# Without a key, voice messages are dropped.
+# openai_api_key   = "..."
+# whisper_base_url = "https://api.groq.com/openai/v1"   # default: OpenAI
+# whisper_model    = "whisper-large-v3-turbo"           # default: whisper-1
 ```
 
-Make the file root-owned and operator-readable only — the bot token
-and adapter token are both secrets:
-
-```bash
-sudo chown root:root /etc/havn-channel-telegram/config.toml
-sudo chmod 600 /etc/havn-channel-telegram/config.toml
-```
-
-## Run
-
-```bash
-havn-channel-telegram --config /etc/havn-channel-telegram/config.toml
-```
-
-For systemd, drop a unit file:
+### 5. Run it under systemd
 
 ```ini
 # /etc/systemd/system/havn-channel-telegram.service
 [Unit]
 Description=havn channel adapter for Telegram
-After=network.target havn-gateway.service
-Wants=havn-gateway.service
+After=network.target havn.service
+Wants=havn.service
 
 [Service]
 ExecStart=/usr/local/bin/havn-channel-telegram --config /etc/havn-channel-telegram/config.toml
 Restart=always
 RestartSec=5
-# Don't run as root in production — create a dedicated user with no
-# shell and no home directory; chown the config file to it.
 User=havn-tg
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -123,92 +117,43 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now havn-channel-telegram.service
+sudo systemctl enable --now havn-channel-telegram
 sudo journalctl -u havn-channel-telegram -f
 ```
 
-## Verify
+### 6. Let people in
 
-DM your bot from Telegram. The daemon's log shows:
+With `dm_policy = "allowlist"`, only senders in `allow_from` and senders admitted with an invite code may use the bot. Create a code on the gateway host and give it to the person; they send it to the bot once:
+
+```bash
+havn invite create --channel telegram --account acme-bot              # expires in 24h
+havn access list --channel telegram --account acme-bot                # who may talk to it
+havn access revoke --channel telegram --account acme-bot tg:123456789 # take it back
+```
+
+## Check that it works
+
+The log shows the connection to the gateway:
 
 ```
 INFO havn_channel_telegram: havn WS connected
-INFO havn_channel_telegram: havn-channel-telegram starting
 ```
 
-Then when you send `hello`:
+Then message the bot in Telegram; the bound agent answers, and typing `/` shows its commands.
 
-```
-DEBUG havn_channel_telegram: telegram inbound (translated to ChannelInbound)
-DEBUG havn_channel_telegram: havn outbound (sending Telegram sendMessage)
-```
+If it does not answer:
 
-The bot replies in Telegram with whatever the bound havn agent says.
+1. `havn doctor` checks the gateway; `havn agent list` shows whether the bound agent exists and runs.
+2. In the daemon's log, a refused connection means the adapter token does not match the credential, or `channel_id` / `account_id` do not match an account in the gateway's config.
+3. In the gateway's log (`journalctl -u havn`), a message from a sender who is not allowed is refused there: add them to `allow_from` or give them an invite code.
 
-If the bot never replies:
+## Limitations
 
-1. **`havn doctor`** — confirms the gateway is up and credentials decrypt.
-2. **`havn agent status <agent_id>`** — confirms the bound agent is running.
-3. Check the daemon log for `havn WS: connect failed` (auth issue —
-   adapter_token mismatch with what's in `havn credential add`) or
-   `dropping inbound: no [[bindings]] entry` (binding misconfigured).
-
-## How this fits the havn architecture
-
-havn's spec §3 separates inbound message ingest and outbound delivery
-from the gateway core via a stable HTTP+WS protocol. This daemon
-implements the **adapter** half of that contract:
-
-```
-   Telegram user ────┐
-                     │ messages
-                     ▼
-       Telegram Bot API (api.telegram.org)
-                     │
-                     │ getUpdates (long-poll)
-                     ▼
-       ┌───────── havn-channel-telegram ─────────┐
-       │  - translate Telegram Update → ChannelInbound│
-       │  - translate ChannelOutbound → Telegram sendMessage│
-       └─────────────────┬──────────────────────┘
-                         │ WebSocket /api/v1/channel
-                         │ (X-Adapter-Token header)
-                         ▼
-       ┌─────────── havn gateway ─────────────┐
-       │  - resolve binding (channel, account_id) → agent_id│
-       │  - forward to agent runtime over Unix socket       │
-       └─────────────────┬─────────────────────┘
-                         ▼
-                   havn agent (in its namespace)
-```
-
-Adapter ↔ gateway is a **stable protocol**, not an unstable internal
-ABI. A future Slack or Discord adapter is a separate repo
-implementing the same protocol; havn-core stays unchanged.
-
-## Limitations (v0.2)
-
-- **Group / supergroup / channel chats are dropped** with a debug log.
-- **Files.** A photo (its largest size) or a document a user sends is
-  downloaded from Telegram and passed to the gateway's
-  `POST /api/v1/channel/files`, which saves it in the agent's inbox (and
-  reads the text of a PDF, Word document or spreadsheet); the message
-  then carries it, with its caption as text. A file the agent sends
-  with `send_file` is fetched from the gateway and posted with
-  `sendDocument`, with its caption. Telegram lets bots download files of
-  up to 20 MB; the gateway takes up to 25 MB. A file that cannot be
-  passed on is named in the message, so the agent can say so.
-- **Images in agent replies** that are not files the agent sent are
-  still flattened to text (`[image: <url>]`).
-- **Reconnect drops in-flight messages.** havn's outbound replay
-  buffer (spec §3.2 — last 5 minutes per account) lands in a
-  follow-up — Layer D2. Today, when the daemon reconnects after a
-  disconnect longer than the round-trip, any agent reply emitted
-  during the gap is dropped at the gateway.
-- **No webhook mode.** Long-poll only. Webhook (Telegram pushes to a
-  public TLS endpoint) lowers latency but requires public DNS + cert;
-  out of scope for self-host first cut.
+- Private chats only; groups, supergroups and channels are dropped.
+- Replies the agent sends while the daemon is disconnected from the gateway are lost: the gateway keeps them for 5 minutes, but this daemon does not ask for them yet when it reconnects.
+- Images in a reply that are not files the agent sent are shown as text (`[image: <url>]`).
+- Long polling only, no webhook.
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+Apache License 2.0; see [LICENSE](LICENSE).

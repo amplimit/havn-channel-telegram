@@ -2,7 +2,7 @@
 # real values. See README.md for details.
 
 bot_token            = "YOUR_TELEGRAM_BOT_TOKEN"
-havn_gateway         = "ws://127.0.0.1:8100"
+havn_gateway         = "ws://127.0.0.1:8080"
 adapter_token        = "YOUR_ADAPTER_TOKEN"
 channel_id           = "telegram"
 account_id           = "my-tg-bot"
