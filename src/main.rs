@@ -222,7 +222,17 @@ async fn translate_update(
     // Bot API level (a single Update.message carries one); venue is
     // the only overlap (it includes both location and venue fields).
     let content = if let Some(voice) = &msg.voice {
-        translate_voice(tg, whisper, gateway, &sender_id, voice, &mut attachments).await
+        let caption = msg.caption.as_deref();
+        translate_voice(
+            tg,
+            whisper,
+            gateway,
+            &sender_id,
+            voice,
+            caption,
+            &mut attachments,
+        )
+        .await
     } else if let Some(venue) = &msg.venue {
         ChannelMessageContent::Location {
             latitude: venue.location.latitude,
@@ -252,7 +262,7 @@ async fn translate_update(
     } else if let Some(text) = &msg.text {
         ChannelMessageContent::Text { text: text.clone() }
     } else {
-        media_content(msg, tg, gateway, &sender_id, &mut attachments).await
+        media_content(msg, tg, gateway, &sender_id, &mut attachments).await?
     };
 
     let inbound = ChannelInbound {
@@ -271,24 +281,25 @@ async fn translate_update(
     Some(ChannelFrame::Inbound(inbound))
 }
 
-/// A message that carries a file, a sticker, a poll or something this
-/// bot cannot pass on, for the agent.
+/// A message that carries a file, a sticker, a poll or a kind of content
+/// this bot cannot pass on, for the agent; `None` for a service message
+/// (a pin, a timer change) that is no one's message to answer.
 async fn media_content(
     msg: &telegram::Message,
     tg: &Telegram,
     gateway: &Gateway,
     sender_id: &str,
     attachments: &mut Vec<Attachment>,
-) -> ChannelMessageContent {
-    if let Some(sizes) = &msg.photo {
+) -> Option<ChannelMessageContent> {
+    Some(if let Some(sizes) = &msg.photo {
         // The largest of the sizes Telegram keeps.
         let Some(best) = sizes
             .iter()
             .max_by_key(|p| u64::from(p.width) * u64::from(p.height))
         else {
-            return ChannelMessageContent::Text {
+            return Some(ChannelMessageContent::Text {
                 text: "[The sender sent a photo that could not be read.]".to_string(),
-            };
+            });
         };
         let received = receive_file(
             tg,
@@ -324,7 +335,7 @@ async fn media_content(
         ChannelMessageContent::Text {
             text: poll_text(poll),
         }
-    } else {
+    } else if msg.unsupported_content() {
         // Not dropped silently: the gateway answers a sender who is not
         // paired, and the agent can tell one who is.
         debug!(
@@ -336,7 +347,10 @@ async fn media_content(
                    such as a game, a dice roll or a story. Ask them to send text or a file.]"
                 .to_string(),
         }
-    }
+    } else {
+        debug!(message_id = msg.message_id, "ignoring a service message");
+        return None;
+    })
 }
 
 /// The video, video note or audio file `msg` carries, with the name and
@@ -451,8 +465,10 @@ async fn translate_voice(
     gateway: &Gateway,
     sender_id: &str,
     voice: &telegram::Voice,
+    caption: Option<&str>,
     attachments: &mut Vec<Attachment>,
 ) -> ChannelMessageContent {
+    let caption = caption.filter(|c| !c.trim().is_empty());
     let audio = match tg.get_file(&voice.file_id).await {
         Ok(path) => tg.download_file(&path).await,
         Err(e) => Err(e),
@@ -480,7 +496,10 @@ async fn translate_voice(
                 );
                 // Not the file's URL: it holds the bot token.
                 return ChannelMessageContent::Audio {
-                    transcript,
+                    transcript: match caption {
+                        Some(caption) => format!("{caption}\n\n{transcript}"),
+                        None => transcript,
+                    },
                     duration_seconds: Some(voice.duration),
                     url: None,
                 };
@@ -494,22 +513,41 @@ async fn translate_voice(
     let received = gateway
         .upload(sender_id, "voice.ogg", "audio/ogg", audio)
         .await;
-    let note = format!(
-        "[A voice message of {} seconds, attached as voice.ogg; {why}.]",
+    // Says "attached" only when it was; `file_message` adds why not.
+    let attached = if received.is_ok() {
+        ", attached as voice.ogg"
+    } else {
+        ""
+    };
+    let mut note = format!(
+        "[A voice message of {} seconds{attached}; {why}.]",
         voice.duration
     );
+    if let Some(caption) = caption {
+        note = format!("{caption}\n\n{note}");
+    }
     file_message(received, Some(&note), "voice.ogg", attachments)
 }
 
 /// Send `text` to `chat_id`, in as many messages as Telegram's limit
-/// takes; the first replies to `reply_to`.
+/// takes; the first replies to `reply_to`. When a part cannot be sent
+/// after the first, the person is told the rest did not come.
 async fn send_text(tg: &Telegram, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
-    for (n, part) in telegram::split_text(text, telegram::MESSAGE_UNITS)
-        .iter()
-        .enumerate()
-    {
-        tg.send_message(chat_id, part, if n == 0 { reply_to } else { None })
-            .await?;
+    let parts = telegram::split_text(text, telegram::MESSAGE_UNITS);
+    for (n, part) in parts.iter().enumerate() {
+        if let Err(e) = tg
+            .send_message(chat_id, part, if n == 0 { reply_to } else { None })
+            .await
+        {
+            if n > 0 {
+                let note = format!(
+                    "(The rest of this reply, {} more part(s), could not be delivered.)",
+                    parts.len() - n
+                );
+                let _ = tg.send_message(chat_id, &note, None).await;
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }
