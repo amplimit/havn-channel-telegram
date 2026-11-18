@@ -668,7 +668,7 @@ async fn send_file(
 /// The "typing…" indicator of each chat waiting for a reply (issue #12):
 /// Telegram shows it for about five seconds, and hides it when the bot
 /// sends something, so it is sent every [`TYPING_EVERY`] while replies
-/// are due, for at most [`TYPING_FOR`] at a time. The gateway does not say
+/// are due (again after each reply while more are), for at most [`TYPING_FOR`] at a time. The gateway does not say
 /// which reply answers which message, so a chat counts the messages it
 /// waits on: one more for each that comes, one fewer for each reply.
 #[derive(Clone)]
@@ -736,14 +736,6 @@ impl Typing {
         }
         drop(chats);
         self.again(chat_id);
-    }
-
-    /// Something that is not a reply (a file) was sent to `chat_id`:
-    /// Telegram hid the indicator, which shows again if a reply is due.
-    fn sent(&self, chat_id: i64) {
-        if self.chats().contains_key(&chat_id) {
-            self.again(chat_id);
-        }
     }
 
     fn again(&self, chat_id: i64) {
@@ -815,14 +807,9 @@ async fn havn_outbound_loop(
                 if let Err(e) = deliver_outbound(&tg, &gateway, &o).await {
                     warn!(error = %e, seq = o.seq, "telegram sendMessage failed; dropping");
                 }
-                // A file is sent while the reply is still coming; text is a
-                // reply.
+                // A reply came: a file (as some replies are) or text.
                 if let Some(chat_id) = chat_of(&o.to) {
-                    if matches!(o.content, ChannelMessageContent::File { .. }) {
-                        typing.sent(chat_id);
-                    } else {
-                        typing.replied(chat_id);
-                    }
+                    typing.replied(chat_id);
                 }
             }
             ChannelFrame::Pong => {} // server keepalive, ignore
@@ -1041,22 +1028,18 @@ mod tests {
             2,
             "shown again: a reply is still due"
         );
-        typing.sent(7);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(sent.load(Ordering::Relaxed), 3, "shown again after a file");
         typing.replied(7);
         tokio::time::sleep(Duration::from_secs(30)).await;
         assert_eq!(
             sent.load(Ordering::Relaxed),
-            3,
+            2,
             "none once every reply came"
         );
-        typing.sent(7);
         typing.replied(7);
         tokio::time::sleep(Duration::from_secs(30)).await;
         assert_eq!(
             sent.load(Ordering::Relaxed),
-            3,
+            2,
             "nothing due, nothing shown"
         );
     }

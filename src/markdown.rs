@@ -65,7 +65,14 @@ fn open_fence(markdown: &str) -> Option<String> {
             last = Some(range);
         }
     }
-    let block = &markdown[last?];
+    let range = last?;
+    // One in a quote is not opened again: its next part would need the
+    // quote's markers too.
+    let line_start = markdown[..range.start].rfind('\n').map_or(0, |at| at + 1);
+    if markdown[line_start..range.start].contains('>') {
+        return None;
+    }
+    let block = &markdown[range];
     let opener = block.lines().next()?.trim_start();
     let mark = opener.chars().next()?;
     let run = opener.chars().take_while(|c| *c == mark).count();
@@ -532,6 +539,8 @@ mod tests {
         assert_eq!(open_fence("```rust\nlet x = 1;\n```\n"), None);
         assert_eq!(open_fence("~~~~\na\n~~~\nb"), Some("~~~~".into()));
         assert_eq!(open_fence("> ```\n> quoted\n> ```"), None);
+        assert_eq!(open_fence("> ```\n> quoted, cut here"), None);
+        assert_eq!(open_fence("- ```sh\n  ls"), Some("```sh".into()));
     }
 
     #[test]
