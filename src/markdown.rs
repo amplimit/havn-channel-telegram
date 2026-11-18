@@ -55,31 +55,27 @@ pub fn split(markdown: &str, max: usize) -> Vec<String> {
     parts
 }
 
-/// The opening line of the code block `markdown` leaves open, if any.
+/// The opening fence of the code block `markdown` leaves open, if any:
+/// as the parser reads it, so inline code and indented text are not taken
+/// for one.
 fn open_fence(markdown: &str) -> Option<String> {
-    let mut open: Option<(String, char, usize)> = None;
-    for line in markdown.lines() {
-        let trimmed = line.trim_start();
-        let Some(mark) = trimmed.chars().next().filter(|c| *c == '`' || *c == '~') else {
-            continue;
-        };
-        let run = trimmed.chars().take_while(|c| *c == mark).count();
-        if run < 3 {
-            continue;
-        }
-        match &open {
-            None => open = Some((line.to_string(), mark, run)),
-            Some((_, m, n))
-                if *m == mark
-                    && run >= *n
-                    && trimmed[run * mark.len_utf8()..].trim().is_empty() =>
-            {
-                open = None;
-            }
-            Some(_) => {}
+    let mut last = None;
+    for (event, range) in Parser::new_ext(markdown, Options::empty()).into_offset_iter() {
+        if let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) = event {
+            last = Some(range);
         }
     }
-    open.map(|(line, _, _)| line)
+    let block = &markdown[last?];
+    let opener = block.lines().next()?.trim_start();
+    let mark = opener.chars().next()?;
+    let run = opener.chars().take_while(|c| *c == mark).count();
+    let closed = block.trim_end().lines().skip(1).last().is_some_and(|line| {
+        let fence = line
+            .trim_start_matches(|c: char| c == '>' || c.is_whitespace())
+            .trim_end();
+        fence.chars().count() >= run && fence.chars().all(|c| c == mark)
+    });
+    (!closed).then(|| opener.to_string())
 }
 
 /// The UTF-16 units Telegram counts in `html`: its text, without tags,
@@ -140,15 +136,22 @@ struct Table {
     cell: String,
 }
 
+struct Link {
+    url: String,
+    /// Written as a tag; else as text with its address after it.
+    tag: bool,
+    /// Where its text starts, to tell a link with none.
+    at: usize,
+}
+
 #[derive(Default)]
 struct Writer {
     out: String,
     /// The lists the text is in, innermost last: the next number of an
     /// ordered one.
     lists: Vec<Option<u64>>,
-    /// The links the text is in: `None` for a tag, else the address to
-    /// show after the text.
-    links: Vec<Option<String>>,
+    /// The links the text is in, innermost last.
+    links: Vec<Link>,
     table: Option<Table>,
     quotes: usize,
     code: bool,
@@ -268,14 +271,22 @@ impl Writer {
             Tag::Subscript => self.text("~"),
             Tag::Superscript => self.text("^"),
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
-                if self.table.is_none() && linkable(&dest_url) {
+                // Not a link in a link (an image in one): Telegram takes
+                // no nesting of them.
+                let tag = self.table.is_none()
+                    && linkable(&dest_url)
+                    && !self.links.iter().any(|l| l.tag);
+                if tag {
                     self.out.push_str("<a href=\"");
                     self.out.push_str(&escape(&dest_url));
                     self.out.push_str("\">");
-                    self.links.push(None);
-                } else {
-                    self.links.push(Some(dest_url.to_string()));
                 }
+                let at = self.written();
+                self.links.push(Link {
+                    url: dest_url.to_string(),
+                    tag,
+                    at,
+                });
             }
             _ => {}
         }
@@ -320,13 +331,31 @@ impl Writer {
             TagEnd::Strikethrough => self.tag("</s>"),
             TagEnd::Subscript => self.text("~"),
             TagEnd::Superscript => self.text("^"),
-            TagEnd::Link | TagEnd::Image => match self.links.pop() {
-                Some(None) => self.out.push_str("</a>"),
-                Some(Some(url)) if !url.is_empty() => self.text(&format!(" ({url})")),
-                _ => {}
-            },
+            TagEnd::Link | TagEnd::Image => {
+                if let Some(link) = self.links.pop() {
+                    // A link without text shows its address.
+                    let bare = self.written() == link.at;
+                    if link.tag {
+                        if bare {
+                            self.out.push_str(&escape(&link.url));
+                        }
+                        self.out.push_str("</a>");
+                    } else if bare {
+                        self.text(&link.url);
+                    } else if !link.url.is_empty() {
+                        self.text(&format!(" ({})", link.url));
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    /// How much has been written where text goes now.
+    fn written(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(self.out.len(), |table| table.cell.len())
     }
 
     fn text(&mut self, text: &str) {
@@ -477,6 +506,32 @@ mod tests {
             to_html("![a chart](https://example.org/c.png)"),
             "<a href=\"https://example.org/c.png\">a chart</a>"
         );
+    }
+
+    #[test]
+    fn a_link_without_text_shows_its_address() {
+        assert_eq!(
+            to_html("![](https://x.org/c.png)"),
+            "<a href=\"https://x.org/c.png\">https://x.org/c.png</a>"
+        );
+        assert_eq!(to_html("[](ftp://x.org)"), "ftp://x.org");
+        assert_eq!(
+            to_html("[![badge](https://x.org/b.svg)](https://x.org)"),
+            "<a href=\"https://x.org\">badge (https://x.org/b.svg)</a>"
+        );
+    }
+
+    #[test]
+    fn only_real_code_blocks_are_fences() {
+        assert_eq!(open_fence("```foo``` bar\nmore"), None);
+        assert_eq!(open_fence("    ```\n    indented"), None);
+        assert_eq!(
+            open_fence("text\n```rust\nlet x = 1;\n"),
+            Some("```rust".into())
+        );
+        assert_eq!(open_fence("```rust\nlet x = 1;\n```\n"), None);
+        assert_eq!(open_fence("~~~~\na\n~~~\nb"), Some("~~~~".into()));
+        assert_eq!(open_fence("> ```\n> quoted\n> ```"), None);
     }
 
     #[test]

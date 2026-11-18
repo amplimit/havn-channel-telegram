@@ -151,40 +151,57 @@ impl Telegram {
     ) -> Result<()> {
         let method = kind.method();
         let url = format!("{}/{method}", self.base);
-        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_string());
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part(kind.field(), part);
-        if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
-            form = form.text("caption", caption.to_string());
-            if html {
-                form = form.text("parse_mode", "HTML");
+        // Telegram may ask the bot to slow down, and says how long to wait.
+        for tried in 1..=SEND_TRIES {
+            let part =
+                reqwest::multipart::Part::bytes(bytes.clone()).file_name(filename.to_string());
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .part(kind.field(), part);
+            if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
+                form = form.text("caption", caption.to_string());
+                if html {
+                    form = form.text("parse_mode", "HTML");
+                }
+            }
+            if let Some(rt) = reply_to_message_id {
+                form = form
+                    .text("reply_to_message_id", rt.to_string())
+                    .text("allow_sending_without_reply", "true");
+            }
+            let resp: ApiResponse<serde_json::Value> = self
+                .http
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(180))
+                .multipart(form)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .with_context(|| format!("{method} request"))?
+                .json()
+                .await
+                .with_context(|| format!("{method} body parse"))?;
+            if resp.ok {
+                return Ok(());
+            }
+            match resp.parameters.and_then(|p| p.retry_after) {
+                Some(wait) if tried < SEND_TRIES => {
+                    tracing::info!(
+                        wait,
+                        "telegram asked to slow down; sending the file again after the wait"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        wait.min(MAX_RETRY_AFTER_SECONDS),
+                    ))
+                    .await;
+                }
+                _ => anyhow::bail!(
+                    "telegram {method} returned ok=false: {}",
+                    resp.description.unwrap_or_default()
+                ),
             }
         }
-        if let Some(rt) = reply_to_message_id {
-            form = form
-                .text("reply_to_message_id", rt.to_string())
-                .text("allow_sending_without_reply", "true");
-        }
-        let resp: ApiResponse<serde_json::Value> = self
-            .http
-            .post(&url)
-            .timeout(std::time::Duration::from_secs(180))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("{method} request"))?
-            .json()
-            .await
-            .with_context(|| format!("{method} body parse"))?;
-        if !resp.ok {
-            anyhow::bail!(
-                "telegram {method} returned ok=false: {}",
-                resp.description.unwrap_or_default()
-            );
-        }
-        Ok(())
+        anyhow::bail!("telegram {method}: still refused after {SEND_TRIES} tries")
     }
 
     /// Send a "typing" chat action. The indicator lasts ~5 seconds on
@@ -380,6 +397,12 @@ pub fn refused_markup(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("can't parse entities")
 }
 
+/// Whether Telegram answered and refused, as opposed to a request that
+/// failed on the way, which it may have taken.
+pub fn refused(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("returned ok=false")
+}
+
 /// How a file goes to Telegram (issue #15): an image it can show as a
 /// photo, a GIF as an animation, anything else as a document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,7 +451,7 @@ pub fn file_kind(bytes: &[u8]) -> FileKind {
         Some((w, h))
             if w > 0
                 && h > 0
-                && w + h <= MAX_PHOTO_SIDES
+                && u64::from(w) + u64::from(h) <= u64::from(MAX_PHOTO_SIDES)
                 && w.max(h) <= w.min(h).saturating_mul(MAX_PHOTO_RATIO) =>
         {
             FileKind::Photo
@@ -887,6 +910,11 @@ mod split_tests {
             "over 20 to 1"
         );
         assert_eq!(file_kind(&png(0, 10)), FileKind::Document);
+        assert_eq!(
+            file_kind(&png(0x8000_0000, 0x8000_0000)),
+            FileKind::Document,
+            "no overflow"
+        );
         let mut big = png(100, 100);
         big.resize(MAX_PHOTO_BYTES + 1, 0);
         assert_eq!(file_kind(&big), FileKind::Document, "over 10 MB");
@@ -924,6 +952,12 @@ mod split_tests {
         assert!(!refused_markup(&anyhow::anyhow!(
             "telegram sendMessage returned ok=false: Bad Request: message is too long"
         )));
+        assert!(refused(&anyhow::anyhow!(
+            "telegram sendPhoto returned ok=false: Bad Request: PHOTO_INVALID_DIMENSIONS"
+        )));
+        assert!(!refused(
+            &anyhow::anyhow!("operation timed out").context("sendPhoto request")
+        ));
     }
 
     #[test]
