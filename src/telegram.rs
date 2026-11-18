@@ -1083,6 +1083,78 @@ mod split_tests {
         ));
     }
 
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn images_telegram_can_show_go_as_photos() {
+        assert_eq!(file_kind(&png(1280, 960)), FileKind::Photo);
+        assert_eq!(
+            file_kind(&png(9000, 2000)),
+            FileKind::Document,
+            "over 10000 together"
+        );
+        assert_eq!(
+            file_kind(&png(4200, 200)),
+            FileKind::Document,
+            "over 20 to 1"
+        );
+        assert_eq!(file_kind(&png(0, 10)), FileKind::Document);
+        assert_eq!(
+            file_kind(&png(0x8000_0000, 0x8000_0000)),
+            FileKind::Document,
+            "no overflow"
+        );
+        let mut big = png(100, 100);
+        big.resize(MAX_PHOTO_BYTES + 1, 0);
+        assert_eq!(file_kind(&big), FileKind::Document, "over 10 MB");
+        assert_eq!(file_kind(b"GIF89a\x01\0\x01\0"), FileKind::Animation);
+        assert_eq!(file_kind(b"%PDF-1.7"), FileKind::Document);
+        assert_eq!(
+            file_kind(b"\x89PNG\r\n\x1a\n"),
+            FileKind::Document,
+            "no header"
+        );
+    }
+
+    #[test]
+    fn jpeg_and_webp_sizes_are_read() {
+        // SOI, an APP0 segment, then SOF0 with height 960 and width 1280.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x03,
+            0xC0, 0x05, 0x00, 0x03, 0x01, 0x22, 0x00,
+        ];
+        assert_eq!(image_size(&jpeg), Some((1280, 960)));
+        assert_eq!(file_kind(&jpeg), FileKind::Photo);
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+        webp.extend_from_slice(&[0xFF, 0x04, 0x00, 0xBF, 0x03, 0x00]);
+        assert_eq!(image_size(&webp), Some((1280, 960)));
+        let mut lossy = b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0\0\0\0\x9d\x01\x2a".to_vec();
+        lossy.extend_from_slice(&[0x00, 0x05, 0xC0, 0x03]);
+        assert_eq!(image_size(&lossy), Some((1280, 960)));
+    }
+
+    #[test]
+    fn a_formatting_refusal_is_told_apart() {
+        assert!(refused_markup(&anyhow::anyhow!(
+            "telegram sendMessage returned ok=false: Bad Request: can't parse entities: Unsupported start tag"
+        )));
+        assert!(!refused_markup(&anyhow::anyhow!(
+            "telegram sendMessage returned ok=false: Bad Request: message is too long"
+        )));
+        assert!(refused(&anyhow::anyhow!(
+            "telegram sendPhoto returned ok=false: Bad Request: PHOTO_INVALID_DIMENSIONS"
+        )));
+        assert!(!refused(
+            &anyhow::anyhow!("operation timed out").context("sendPhoto request")
+        ));
+    }
+
     #[test]
     fn a_dice_roll_is_content_and_a_pin_is_not() {
         let msg = |extra: serde_json::Value| -> Message {
