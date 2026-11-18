@@ -668,9 +668,10 @@ async fn send_file(
 /// The "typing…" indicator of each chat waiting for a reply (issue #12):
 /// Telegram shows it for about five seconds, and hides it when the bot
 /// sends something, so it is sent every [`TYPING_EVERY`] while replies
-/// are due (again after each reply while more are), for at most [`TYPING_FOR`] at a time. The gateway does not say
-/// which reply answers which message, so a chat counts the messages it
-/// waits on: one more for each that comes, one fewer for each reply.
+/// are due (again after each reply while more are), for at most
+/// [`TYPING_FOR`] at a time. The gateway does not say which reply answers
+/// which message, so a chat counts the messages it waits on: one more for
+/// each that comes, one fewer for each reply.
 #[derive(Clone)]
 struct Typing {
     send: Arc<SendTyping>,
