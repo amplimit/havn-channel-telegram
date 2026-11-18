@@ -22,14 +22,19 @@
 mod config;
 mod gateway;
 mod havn_ws;
+mod markdown;
 mod telegram;
 mod types;
 mod whisper;
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -100,6 +105,13 @@ async fn main() -> Result<()> {
         &cfg.account_id,
     )
     .context("havn gateway client init")?;
+    let typing = {
+        let tg = telegram.clone();
+        Typing::new(move |chat_id| {
+            let tg = tg.clone();
+            Box::pin(async move { tg.send_typing(chat_id).await })
+        })
+    };
     let ws = WsClient::spawn(WsConfig {
         gateway_url: cfg.havn_gateway.clone(),
         adapter_token: cfg.adapter_token.clone(),
@@ -122,8 +134,14 @@ async fn main() -> Result<()> {
         gateway.clone(),
         outbound_tx.clone(),
         cfg.account_id.clone(),
+        typing.clone(),
     ));
-    let outbound_task = tokio::spawn(havn_outbound_loop(telegram.clone(), gateway, inbound_rx));
+    let outbound_task = tokio::spawn(havn_outbound_loop(
+        telegram.clone(),
+        gateway,
+        inbound_rx,
+        typing,
+    ));
 
     // Wait for shutdown signal. Dropping `outbound_tx` triggers
     // graceful WS close + connection_loop exit.
@@ -156,6 +174,7 @@ async fn telegram_inbound_loop(
     gateway: Gateway,
     outbound_tx: tokio::sync::mpsc::Sender<ChannelFrame>,
     account_id: String,
+    typing: Typing,
 ) -> Result<()> {
     let seq = Arc::new(AtomicU64::new(1));
     let mut offset: i64 = 0;
@@ -175,15 +194,20 @@ async fn telegram_inbound_loop(
                 .as_ref()
                 .filter(|m| m.chat.kind == "private")
                 .map(|m| m.chat.id);
-            // Fire typing indicator before translate (which may do STT).
-            // Spawned fire-and-forget so it never blocks the inbound loop.
-            // Only for private chats — group messages are dropped by translate_update.
+            // Typing shows from before translate (which may do STT) until
+            // the reply comes (issue #12); only for private chats, as
+            // group messages are dropped by translate_update.
             if let Some(cid) = chat_id {
-                let tg_c = tg.clone();
-                tokio::spawn(async move { tg_c.send_typing(cid).await });
+                typing.start(cid);
             }
             let frame =
                 translate_update(&update, &tg, whisper.as_ref(), &gateway, &account_id, &seq).await;
+            // A service message gets no reply.
+            if frame.is_none()
+                && let Some(cid) = chat_id
+            {
+                typing.stop(cid);
+            }
             if let Some(f) = frame
                 && outbound_tx.send(f).await.is_err()
             {
@@ -529,27 +553,177 @@ async fn translate_voice(
     file_message(received, Some(&note), "voice.ogg", attachments)
 }
 
-/// Send `text` to `chat_id`, in as many messages as Telegram's limit
-/// takes; the first replies to `reply_to`. When a part cannot be sent
-/// after the first, the person is told the rest did not come.
+/// Send `text`, the agent's Markdown, to `chat_id`, formatted, in as many
+/// messages as Telegram's limit takes; the first replies to `reply_to`.
+/// When a part cannot be sent after the first, the person is told the
+/// rest did not come.
 async fn send_text(tg: &Telegram, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
-    let parts = telegram::split_text(text, telegram::MESSAGE_UNITS);
+    let parts = markdown::split(text, telegram::MESSAGE_UNITS);
     for (n, part) in parts.iter().enumerate() {
-        if let Err(e) = tg
-            .send_message(chat_id, part, if n == 0 { reply_to } else { None })
-            .await
-        {
+        if let Err(e) = send_part(tg, chat_id, part, if n == 0 { reply_to } else { None }).await {
             if n > 0 {
                 let note = format!(
                     "(The rest of this reply, {} more part(s), could not be delivered.)",
                     parts.len() - n
                 );
-                let _ = tg.send_message(chat_id, &note, None).await;
+                let _ = tg.send_message(chat_id, &note, false, None).await;
             }
             return Err(e);
         }
     }
     Ok(())
+}
+
+/// One part of a reply, formatted (issue #11); as plain text when
+/// Telegram refuses the formatting, or when formatting makes it longer
+/// than a message.
+async fn send_part(
+    tg: &Telegram,
+    chat_id: i64,
+    markdown: &str,
+    reply_to: Option<i64>,
+) -> Result<()> {
+    let html = markdown::to_html(markdown);
+    if markdown::visible_units(&html) <= telegram::MESSAGE_UNITS {
+        match tg.send_message(chat_id, &html, true, reply_to).await {
+            Err(e) if telegram::refused_markup(&e) => {
+                warn!(error = %e, "telegram refused a reply's formatting; sending it as plain text");
+            }
+            sent => return sent,
+        }
+    }
+    for (n, piece) in telegram::split_text(markdown, telegram::MESSAGE_UNITS)
+        .iter()
+        .enumerate()
+    {
+        tg.send_message(chat_id, piece, false, if n == 0 { reply_to } else { None })
+            .await?;
+    }
+    Ok(())
+}
+
+/// Send file `bytes` with `caption`, the agent's Markdown: an image as a
+/// photo and a GIF as an animation when Telegram takes them (issue #15),
+/// else as a document; the caption formatted, else plain. What of the
+/// caption does not fit goes on after the file.
+async fn send_file(
+    tg: &Telegram,
+    chat_id: i64,
+    bytes: Vec<u8>,
+    filename: &str,
+    caption: Option<&str>,
+    reply_to: Option<i64>,
+) -> Result<()> {
+    let (head, rest) = caption.map_or((String::new(), None), telegram::caption_parts);
+    let html = markdown::to_html(&head);
+    let mut formatted = markdown::visible_units(&html) <= telegram::CAPTION_UNITS;
+    let mut kind = telegram::file_kind(&bytes);
+    loop {
+        let caption = if formatted { &html } else { &head };
+        match tg
+            .send_file(
+                kind,
+                chat_id,
+                bytes.clone(),
+                filename,
+                Some(caption),
+                formatted,
+                reply_to,
+            )
+            .await
+        {
+            Ok(()) => break,
+            Err(e) if formatted && telegram::refused_markup(&e) => {
+                warn!(error = %e, "telegram refused a caption's formatting; sending it as plain text");
+                formatted = false;
+            }
+            Err(e) if kind != telegram::FileKind::Document => {
+                warn!(filename, ?kind, error = %format!("{e:#}"), "telegram refused a file as shown; sending it as a document");
+                kind = telegram::FileKind::Document;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(rest) = rest {
+        send_text(tg, chat_id, &rest, None).await?;
+    }
+    Ok(())
+}
+
+/// The "typing…" indicator of each chat waiting for a reply (issue #12):
+/// Telegram shows it for about five seconds, so it is sent again every
+/// [`TYPING_EVERY`] until the reply comes, or for at most [`TYPING_FOR`].
+#[derive(Clone)]
+struct Typing {
+    send: Arc<SendTyping>,
+    /// Each chat's running indicator, with the number that tells it from a
+    /// later one in the same chat.
+    chats: Arc<Mutex<HashMap<i64, (u64, tokio::task::AbortHandle)>>>,
+    next: Arc<AtomicU64>,
+}
+
+/// How the indicator is sent to a chat.
+type SendTyping = dyn Fn(i64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
+
+const TYPING_EVERY: Duration = Duration::from_secs(4);
+const TYPING_FOR: Duration = Duration::from_secs(300);
+
+impl Typing {
+    fn new(
+        send: impl Fn(i64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            send: Arc::new(send),
+            chats: Arc::new(Mutex::new(HashMap::new())),
+            next: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Show the indicator in `chat_id` from now, in place of one already
+    /// showing.
+    fn start(&self, chat_id: i64) {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let send = Arc::clone(&self.send);
+        let chats = Arc::clone(&self.chats);
+        let task = tokio::spawn(async move {
+            let until = tokio::time::Instant::now() + TYPING_FOR;
+            loop {
+                send(chat_id).await;
+                if tokio::time::Instant::now() + TYPING_EVERY > until {
+                    break;
+                }
+                tokio::time::sleep(TYPING_EVERY).await;
+            }
+            let mut chats = chats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if chats
+                .get(&chat_id)
+                .is_some_and(|(running, _)| *running == id)
+            {
+                chats.remove(&chat_id);
+            }
+        });
+        let mut chats = self
+            .chats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, earlier)) = chats.insert(chat_id, (id, task.abort_handle())) {
+            earlier.abort();
+        }
+    }
+
+    /// Stop the indicator in `chat_id`, if it shows.
+    fn stop(&self, chat_id: i64) {
+        let removed = self
+            .chats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&chat_id);
+        if let Some((_, task)) = removed {
+            task.abort();
+        }
+    }
 }
 
 /// havn → Telegram. Drain WS-received frames and translate each
@@ -560,6 +734,7 @@ async fn havn_outbound_loop(
     tg: Telegram,
     gateway: Gateway,
     mut inbound_rx: tokio::sync::mpsc::Receiver<ChannelFrame>,
+    typing: Typing,
 ) -> Result<()> {
     // The menu last set, so a reconnect does not set it again.
     let mut menu: Option<Vec<types::ChannelCommand>> = None;
@@ -581,6 +756,10 @@ async fn havn_outbound_loop(
                 }
             }
             ChannelFrame::Outbound(o) => {
+                // The reply has come: the chat stops showing typing.
+                if let Some(chat_id) = chat_of(&o.to) {
+                    typing.stop(chat_id);
+                }
                 if let Err(e) = deliver_outbound(&tg, &gateway, &o).await {
                     warn!(error = %e, seq = o.seq, "telegram sendMessage failed; dropping");
                 }
@@ -605,13 +784,14 @@ async fn havn_outbound_loop(
     Ok(())
 }
 
+/// The chat of an outbound `to` (`tg:<chat_id>`).
+fn chat_of(to: &str) -> Option<i64> {
+    to.strip_prefix("tg:")?.parse().ok()
+}
+
 async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound) -> Result<()> {
-    // Parse `to` (`tg:<chat_id>`).
-    let chat_id: i64 =
-        o.to.strip_prefix("tg:")
-            .ok_or_else(|| anyhow::anyhow!("outbound `to` not in tg:<id> format: {:?}", o.to))?
-            .parse()
-            .with_context(|| format!("parse chat_id from {:?}", o.to))?;
+    let chat_id = chat_of(&o.to)
+        .ok_or_else(|| anyhow::anyhow!("outbound `to` not in tg:<id> format: {:?}", o.to))?;
 
     let reply_to_message_id = o.in_reply_to.as_deref().and_then(parse_message_id);
 
@@ -632,22 +812,19 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
             caption,
         } => match gateway.fetch(url).await {
             Ok(bytes) => {
-                // What of the caption does not fit goes on after the file.
-                let (head, rest) = caption
-                    .as_deref()
-                    .map_or((String::new(), None), telegram::caption_parts);
-                match tg
-                    .send_document(chat_id, bytes, filename, Some(&head), reply_to_message_id)
-                    .await
+                match send_file(
+                    tg,
+                    chat_id,
+                    bytes,
+                    filename,
+                    caption.as_deref(),
+                    reply_to_message_id,
+                )
+                .await
                 {
-                    Ok(()) => {
-                        if let Some(rest) = rest {
-                            send_text(tg, chat_id, &rest, None).await?;
-                        }
-                        return Ok(());
-                    }
+                    Ok(()) => return Ok(()),
                     Err(e) => {
-                        warn!(filename, error = %format!("{e:#}"), "telegram sendDocument failed");
+                        warn!(filename, error = %format!("{e:#}"), "telegram could not take a file");
                         format!("(A file, {filename}, could not be delivered.)")
                     }
                 }
@@ -763,6 +940,55 @@ mod tests {
         }))
         .expect("poll");
         assert_eq!(poll_text(&poll), "[poll: Lunch?]\n- noodles\n- rice");
+    }
+
+    fn counted() -> (Typing, Arc<AtomicU64>) {
+        let sent = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&sent);
+        let typing = Typing::new(move |_| {
+            let count = Arc::clone(&count);
+            Box::pin(async move {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        });
+        (typing, sent)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_shows_until_the_reply() {
+        let (typing, sent) = counted();
+        typing.start(7);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 3, "at 0, 4 and 8 seconds");
+        typing.stop(7);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 3, "none after the reply");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_ends_on_its_own_and_restarts_once() {
+        let (typing, sent) = counted();
+        typing.start(7);
+        tokio::time::sleep(TYPING_FOR + Duration::from_secs(60)).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 76, "at 0, 4, ... 300 s");
+        assert!(
+            typing.chats.lock().unwrap().is_empty(),
+            "forgotten when done"
+        );
+        typing.start(7);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        typing.start(7);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        // One at 0 and its replacement at 1 and 5: never two at once.
+        assert_eq!(sent.load(Ordering::Relaxed), 79);
+        assert_eq!(typing.chats.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_chat_of_a_reply_is_read() {
+        assert_eq!(chat_of("tg:123"), Some(123));
+        assert_eq!(chat_of("tg:-100"), Some(-100));
+        assert_eq!(chat_of("slack:1"), None);
     }
 
     #[test]

@@ -28,6 +28,10 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+pulldown-cmark = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

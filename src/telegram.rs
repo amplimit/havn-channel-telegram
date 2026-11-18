@@ -1,8 +1,8 @@
 //! Thin Telegram Bot API client — only the endpoints this adapter
 //! needs: `getUpdates` (long-poll inbound), `getFile` and the file
-//! download (voice, photos, documents), `sendMessage` and
-//! `sendDocument` (deliver outbound), and `sendChatAction` (typing
-//! indicator).
+//! download (voice, photos, documents), `sendMessage`, `sendDocument`,
+//! `sendPhoto` and `sendAnimation` (deliver outbound), and
+//! `sendChatAction` (typing indicator).
 //!
 //! Reference: <https://core.telegram.org/bots/api>. Bot tokens look
 //! like `<bot_id>:<random>`; the API base is
@@ -136,23 +136,30 @@ impl Telegram {
         Ok(bytes)
     }
 
-    /// Send a file as a document, with its caption (Telegram keeps 1024
-    /// characters of one).
-    pub async fn send_document(
+    /// Send a file as `kind`, with its caption (Telegram keeps 1024
+    /// characters of one), in HTML when `html`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_file(
         &self,
+        kind: FileKind,
         chat_id: i64,
         bytes: Vec<u8>,
         filename: &str,
         caption: Option<&str>,
+        html: bool,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
-        let url = format!("{}/sendDocument", self.base);
+        let method = kind.method();
+        let url = format!("{}/{method}", self.base);
         let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_string());
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
-            .part("document", part);
+            .part(kind.field(), part);
         if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
             form = form.text("caption", caption.to_string());
+            if html {
+                form = form.text("parse_mode", "HTML");
+            }
         }
         if let Some(rt) = reply_to_message_id {
             form = form
@@ -167,13 +174,13 @@ impl Telegram {
             .send()
             .await
             .map_err(reqwest::Error::without_url)
-            .context("sendDocument request")?
+            .with_context(|| format!("{method} request"))?
             .json()
             .await
-            .context("sendDocument body parse")?;
+            .with_context(|| format!("{method} body parse"))?;
         if !resp.ok {
             anyhow::bail!(
-                "telegram sendDocument returned ok=false: {}",
+                "telegram {method} returned ok=false: {}",
                 resp.description.unwrap_or_default()
             );
         }
@@ -192,12 +199,14 @@ impl Telegram {
         }
     }
 
-    /// Send a plain text message. `reply_to_message_id` threads under
-    /// the original (Telegram-side equivalent of `in_reply_to`).
+    /// Send a text message, in HTML when `html`. `reply_to_message_id`
+    /// threads under the original (Telegram-side equivalent of
+    /// `in_reply_to`).
     pub async fn send_message(
         &self,
         chat_id: i64,
         text: &str,
+        html: bool,
         reply_to_message_id: Option<i64>,
     ) -> Result<()> {
         let url = format!("{}/sendMessage", self.base);
@@ -205,6 +214,9 @@ impl Telegram {
             "chat_id": chat_id,
             "text": text,
         });
+        if html {
+            body["parse_mode"] = serde_json::json!("HTML");
+        }
         if let Some(rt) = reply_to_message_id {
             body["reply_to_message_id"] = serde_json::json!(rt);
             // If the original was deleted, don't error — just send as
@@ -356,10 +368,135 @@ pub fn split_text(text: &str, max: usize) -> Vec<String> {
 /// `caption` as Telegram keeps it with a file: what fits, and the rest
 /// to send as messages after it.
 pub fn caption_parts(caption: &str) -> (String, Option<String>) {
-    let mut parts = split_text(caption, CAPTION_UNITS).into_iter();
+    let mut parts = crate::markdown::split(caption, CAPTION_UNITS).into_iter();
     let first = parts.next().unwrap_or_default();
     let rest: Vec<String> = parts.collect();
     (first, (!rest.is_empty()).then(|| rest.join("\n")))
+}
+
+/// Whether Telegram refused a message for its formatting ("can't parse
+/// entities"), so it can go again as plain text.
+pub fn refused_markup(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("can't parse entities")
+}
+
+/// How a file goes to Telegram (issue #15): an image it can show as a
+/// photo, a GIF as an animation, anything else as a document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Document,
+    Photo,
+    Animation,
+}
+
+impl FileKind {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Document => "sendDocument",
+            Self::Photo => "sendPhoto",
+            Self::Animation => "sendAnimation",
+        }
+    }
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Photo => "photo",
+            Self::Animation => "animation",
+        }
+    }
+}
+
+/// What `sendPhoto` takes: at most 10 MB, width and height at most
+/// 10000 together, and at most 20 times as wide as high or high as wide.
+const MAX_PHOTO_BYTES: usize = 10 * 1024 * 1024;
+const MAX_PHOTO_SIDES: u32 = 10_000;
+const MAX_PHOTO_RATIO: u32 = 20;
+
+/// How file `bytes` go: by what they are, not by their name.
+pub fn file_kind(bytes: &[u8]) -> FileKind {
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return FileKind::Animation;
+    }
+    let image = bytes.starts_with(b"\xFF\xD8\xFF")
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP");
+    if !image || bytes.len() > MAX_PHOTO_BYTES {
+        return FileKind::Document;
+    }
+    match image_size(bytes) {
+        Some((w, h))
+            if w > 0
+                && h > 0
+                && w + h <= MAX_PHOTO_SIDES
+                && w.max(h) <= w.min(h).saturating_mul(MAX_PHOTO_RATIO) =>
+        {
+            FileKind::Photo
+        }
+        _ => FileKind::Document,
+    }
+}
+
+/// The width and height of a PNG, JPEG or WebP image, read from its
+/// header.
+fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |at: usize| -> Option<u32> {
+        Some(u32::from(u16::from_be_bytes(
+            bytes.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    let le = |at: usize, n: usize| -> Option<u32> {
+        let slice = bytes.get(at..at + n)?;
+        Some(
+            slice
+                .iter()
+                .rev()
+                .fold(0_u32, |acc, b| (acc << 8) | u32::from(*b)),
+        )
+    };
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        if bytes.get(12..16)? != b"IHDR" {
+            return None;
+        }
+        let be32 = |at: usize| -> Option<u32> {
+            Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+        };
+        return Some((be32(16)?, be32(20)?));
+    }
+    if bytes.starts_with(b"\xFF\xD8") {
+        let mut at = 2;
+        while at + 9 < bytes.len() {
+            if bytes[at] != 0xFF {
+                return None;
+            }
+            let marker = bytes[at + 1];
+            if marker == 0xFF {
+                at += 1;
+                continue;
+            }
+            if (0xD0..=0xD9).contains(&marker) || marker == 0x01 {
+                at += 2;
+                continue;
+            }
+            if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                return Some((be16(at + 7)?, be16(at + 5)?));
+            }
+            at += 2 + usize::try_from(be16(at + 2)?).ok()?;
+        }
+        return None;
+    }
+    if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return match &bytes[12..16] {
+            b"VP8 " => Some((le(26, 2)? & 0x3FFF, le(28, 2)? & 0x3FFF)),
+            b"VP8L" => {
+                let bits = le(21, 4)?;
+                Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
+            }
+            b"VP8X" => Some((le(24, 3)? + 1, le(27, 3)? + 1)),
+            _ => None,
+        };
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -726,6 +863,67 @@ mod split_tests {
             Some("cats")
         );
         assert_eq!(m.poll.expect("poll").options.len(), 2);
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn images_telegram_can_show_go_as_photos() {
+        assert_eq!(file_kind(&png(1280, 960)), FileKind::Photo);
+        assert_eq!(
+            file_kind(&png(9000, 2000)),
+            FileKind::Document,
+            "over 10000 together"
+        );
+        assert_eq!(
+            file_kind(&png(4200, 200)),
+            FileKind::Document,
+            "over 20 to 1"
+        );
+        assert_eq!(file_kind(&png(0, 10)), FileKind::Document);
+        let mut big = png(100, 100);
+        big.resize(MAX_PHOTO_BYTES + 1, 0);
+        assert_eq!(file_kind(&big), FileKind::Document, "over 10 MB");
+        assert_eq!(file_kind(b"GIF89a\x01\0\x01\0"), FileKind::Animation);
+        assert_eq!(file_kind(b"%PDF-1.7"), FileKind::Document);
+        assert_eq!(
+            file_kind(b"\x89PNG\r\n\x1a\n"),
+            FileKind::Document,
+            "no header"
+        );
+    }
+
+    #[test]
+    fn jpeg_and_webp_sizes_are_read() {
+        // SOI, an APP0 segment, then SOF0 with height 960 and width 1280.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x03,
+            0xC0, 0x05, 0x00, 0x03, 0x01, 0x22, 0x00,
+        ];
+        assert_eq!(image_size(&jpeg), Some((1280, 960)));
+        assert_eq!(file_kind(&jpeg), FileKind::Photo);
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+        webp.extend_from_slice(&[0xFF, 0x04, 0x00, 0xBF, 0x03, 0x00]);
+        assert_eq!(image_size(&webp), Some((1280, 960)));
+        let mut lossy = b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0\0\0\0\x9d\x01\x2a".to_vec();
+        lossy.extend_from_slice(&[0x00, 0x05, 0xC0, 0x03]);
+        assert_eq!(image_size(&lossy), Some((1280, 960)));
+    }
+
+    #[test]
+    fn a_formatting_refusal_is_told_apart() {
+        assert!(refused_markup(&anyhow::anyhow!(
+            "telegram sendMessage returned ok=false: Bad Request: can't parse entities: Unsupported start tag"
+        )));
+        assert!(!refused_markup(&anyhow::anyhow!(
+            "telegram sendMessage returned ok=false: Bad Request: message is too long"
+        )));
     }
 
     #[test]
