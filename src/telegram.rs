@@ -123,7 +123,6 @@ impl Telegram {
 
     /// Download the raw bytes of a Telegram-hosted file. URL format
     /// is `https://api.telegram.org/file/bot<token>/<file_path>`.
-    /// Used for voice messages on the way to Whisper.
     pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
         let url = format!(
             "https://api.telegram.org/file/{}/{file_path}",

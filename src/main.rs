@@ -940,15 +940,8 @@ async fn translate_voice(
         "audio/ogg",
     )
     .await;
-    let transcribed = received.as_ref().is_ok_and(|a| a.transcript.is_some());
-    let mut note = if transcribed {
-        format!("[A voice message of {} seconds.]", voice.duration)
-    } else {
-        format!(
-            "[A voice message of {} seconds; it was not transcribed.]",
-            voice.duration
-        )
-    };
+    // Whether it was transcribed, the agent is told with the file.
+    let mut note = format!("[A voice message of {} seconds.]", voice.duration);
     if let Some(caption) = caption {
         note = format!("{caption}\n\n{note}");
     }
