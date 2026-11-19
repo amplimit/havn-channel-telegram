@@ -1362,7 +1362,14 @@ fn vote_message(tg: &Telegram, vote: &telegram::PollAnswer) -> Option<telegram::
         return None;
     }
     let from = vote.user.clone()?;
-    let (chat_id, message_id, answer) = POLLS.lock().ok()?.take(&vote.poll_id)?;
+    let mut polls = POLLS.lock().ok()?;
+    // Only the person it was sent to answers it: a vote in a forwarded copy
+    // leaves it open. In a private chat, the chat is the person.
+    if polls.open.get(&vote.poll_id)?.0 != from.id {
+        return None;
+    }
+    let (chat_id, message_id, answer) = polls.take(&vote.poll_id)?;
+    drop(polls);
     let numbers: Vec<String> = vote
         .option_ids
         .iter()
