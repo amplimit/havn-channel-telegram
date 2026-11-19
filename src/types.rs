@@ -85,6 +85,10 @@ pub struct ChannelOutbound {
     /// the chosen options' numbers (from 1), comma-separated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<Poll>,
+    /// A part of a reply with more to come (havn issue #212): the agent
+    /// is still working.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 /// A question of several answers.

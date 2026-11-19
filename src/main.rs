@@ -1159,6 +1159,14 @@ impl Typing {
         self.again(chat_id);
     }
 
+    /// A part of a reply was sent to `chat_id`, with more to come:
+    /// Telegram hid the indicator, which shows again while a reply is due.
+    fn more(&self, chat_id: i64) {
+        if self.chats().contains_key(&chat_id) {
+            self.again(chat_id);
+        }
+    }
+
     fn again(&self, chat_id: i64) {
         let task = self.spawn(chat_id);
         let mut chats = self.chats();
@@ -1228,9 +1236,14 @@ async fn havn_outbound_loop(
                 if let Err(e) = deliver_outbound(&tg, &gateway, &o).await {
                     warn!(error = %e, seq = o.seq, "telegram sendMessage failed; dropping");
                 }
-                // A reply came: a file (as some replies are) or text.
+                // A reply came: a file (as some replies are) or text. A
+                // part of one has more to come, so typing shows on.
                 if let Some(chat_id) = chat_of(&o.to) {
-                    typing.replied(chat_id);
+                    if o.partial {
+                        typing.more(chat_id);
+                    } else {
+                        typing.replied(chat_id);
+                    }
                 }
             }
             ChannelFrame::Pong => {} // server keepalive, ignore
@@ -1430,6 +1443,11 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
         // future variants compile-error here. Handle them explicitly
         // when added.
     };
+    // The end of a reply whose parts were all sent already says nothing
+    // more (havn issue #212): it only ends the turn.
+    if text.trim().is_empty() && o.buttons.is_empty() {
+        return Ok(());
+    }
 
     send_text(tg, chat_id, &text, reply_to_message_id, &o.buttons).await
 }
@@ -1814,6 +1832,27 @@ mod tests {
             "none once every reply came"
         );
         typing.replied(7);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            sent.load(Ordering::Relaxed),
+            2,
+            "nothing due, nothing shown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_part_of_a_reply_keeps_typing_on() {
+        let (typing, sent) = counted();
+        typing.start(7);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 1);
+        typing.more(7);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 2, "shown again after a part");
+        typing.replied(7);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(sent.load(Ordering::Relaxed), 2, "the reply ends it");
+        typing.more(7);
         tokio::time::sleep(Duration::from_secs(30)).await;
         assert_eq!(
             sent.load(Ordering::Relaxed),
