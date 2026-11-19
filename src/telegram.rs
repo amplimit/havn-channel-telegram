@@ -49,15 +49,21 @@ impl Telegram {
     /// Long-poll for updates from Telegram. `offset` is the
     /// `update_id + 1` of the last update we processed; Telegram
     /// drops anything older than that on its end. Returns up to 100
-    /// updates per call (Telegram's hard cap).
-    pub async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
+    /// updates per call (Telegram's hard cap). `briefly` holds the poll
+    /// open for a second only, while an album waits for its parts.
+    pub async fn get_updates(&self, offset: i64, briefly: bool) -> Result<Vec<Update>> {
         let url = format!("{}/getUpdates", self.base);
-        let resp: ApiResponse<Vec<Update>> = self
+        let timeout = if briefly {
+            1
+        } else {
+            self.poll_timeout_seconds
+        };
+        let resp: ApiResponse<Vec<serde_json::Value>> = self
             .http
             .get(&url)
             .query(&[
                 ("offset", offset.to_string()),
-                ("timeout", self.poll_timeout_seconds.to_string()),
+                ("timeout", timeout.to_string()),
                 // Don't request `edited_message` / `channel_post` /
                 // `inline_query` — agents respond to direct messages
                 // only in v0.2. Future expansion can widen this.
@@ -76,7 +82,14 @@ impl Telegram {
                 resp.description.unwrap_or_default()
             );
         }
-        Ok(resp.result.unwrap_or_default())
+        // Each on its own: one this bot cannot read is passed over, not
+        // left to hold up every message after it.
+        Ok(resp
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(read_update)
+            .collect())
     }
 
     /// Resolve a `file_id` to a downloadable path. Telegram returns
@@ -545,6 +558,22 @@ struct ResponseParameters {
 const SEND_TRIES: usize = 3;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
+/// An update as this bot reads it; one whose message it cannot read keeps
+/// its id, so the poll moves past it, and no message.
+fn read_update(value: serde_json::Value) -> Option<Update> {
+    let update_id = value.get("update_id")?.as_i64()?;
+    match serde_json::from_value::<Update>(value) {
+        Ok(update) => Some(update),
+        Err(e) => {
+            tracing::warn!(update_id, error = %e, "passing over a Telegram update this bot cannot read");
+            Some(Update {
+                update_id,
+                message: None,
+            })
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Update {
     pub update_id: i64,
@@ -592,6 +621,9 @@ pub struct Message {
     pub audio: Option<MediaFile>,
     #[serde(default)]
     pub sticker: Option<Sticker>,
+    /// A GIF; it comes as a `document` too, which is what is passed on.
+    #[serde(default)]
+    pub animation: Option<serde_json::Value>,
     #[serde(default)]
     pub poll: Option<Poll>,
     /// Kinds of message a person sends on purpose that this bot cannot
@@ -606,6 +638,21 @@ pub struct Message {
     pub paid_media: Option<serde_json::Value>,
     #[serde(default)]
     pub checklist: Option<serde_json::Value>,
+    /// The album the message is a part of.
+    #[serde(default)]
+    pub media_group_id: Option<String>,
+    /// The message of this chat it replies to, and the part of it quoted.
+    #[serde(default)]
+    #[allow(clippy::struct_field_names)]
+    pub reply_to_message: Option<Box<Message>>,
+    #[serde(default)]
+    pub quote: Option<TextQuote>,
+    /// The message of another chat it replies to.
+    #[serde(default)]
+    pub external_reply: Option<ExternalReply>,
+    /// Where a forwarded message came from.
+    #[serde(default)]
+    pub forward_origin: Option<MessageOrigin>,
 }
 
 impl Message {
@@ -634,11 +681,25 @@ pub struct MediaFile {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Sticker {
+    #[serde(default)]
+    pub file_id: String,
+    /// The same for every copy of the sticker, unlike `file_id`.
+    #[serde(default)]
+    pub file_unique_id: String,
     #[serde(default)]
     pub emoji: Option<String>,
     #[serde(default)]
     pub set_name: Option<String>,
+    /// A Lottie (`.tgs`) or a video (`.webm`) sticker, which cannot be
+    /// shown as an image; its thumbnail can.
+    #[serde(default)]
+    pub is_animated: bool,
+    #[serde(default)]
+    pub is_video: bool,
+    #[serde(default)]
+    pub thumbnail: Option<PhotoSize>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -646,11 +707,55 @@ pub struct Poll {
     pub question: String,
     #[serde(default)]
     pub options: Vec<PollOption>,
+    #[serde(default)]
+    pub total_voter_count: u32,
+    #[serde(default)]
+    pub is_closed: bool,
+    /// "regular" or "quiz".
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub allows_multiple_answers: bool,
+    /// For a quiz, its answer, when the bot may know it.
+    #[serde(default)]
+    pub correct_option_id: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PollOption {
     pub text: String,
+    #[serde(default)]
+    pub voter_count: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TextQuote {
+    pub text: String,
+}
+
+/// A message of another chat a message replies to: where it came from and
+/// what it carries.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ExternalReply {
+    pub origin: MessageOrigin,
+    #[serde(flatten)]
+    pub content: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Who wrote a forwarded message, or one replied to from another chat.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MessageOrigin {
+    /// `user`, `hidden_user`, `chat` or `channel`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub sender_user: Option<TelegramUser>,
+    #[serde(default)]
+    pub sender_user_name: Option<String>,
+    #[serde(default)]
+    pub sender_chat: Option<Chat>,
+    #[serde(default)]
+    pub chat: Option<Chat>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -714,9 +819,13 @@ pub struct Contact {
 pub struct TelegramUser {
     pub id: i64,
     #[serde(default)]
+    pub is_bot: bool,
+    #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
     pub first_name: Option<String>,
+    #[serde(default)]
+    pub last_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -726,6 +835,24 @@ pub struct Chat {
     /// handles `private` (1:1 DM); others are dropped with a log.
     #[serde(rename = "type")]
     pub kind: String,
+    /// A group's or channel's name.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// The file name extension and media type of an image's `bytes`.
+pub fn image_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(("webp", "image/webp"))
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(("png", "image/png"))
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some(("jpg", "image/jpeg"))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(("gif", "image/gif"))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -872,8 +999,18 @@ mod split_tests {
             "message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"},
             "video": {"file_id": "v", "mime_type": "video/mp4"},
             "audio": {"file_id": "a", "file_name": "song.mp3"},
-            "sticker": {"emoji": "x", "set_name": "cats"},
-            "poll": {"question": "Lunch?", "options": [{"text": "yes"}, {"text": "no"}]}
+            "sticker": {"file_id": "s", "emoji": "x", "set_name": "cats", "is_animated": true,
+                        "thumbnail": {"file_id": "t", "width": 128, "height": 128}},
+            "poll": {"question": "Lunch?", "options": [{"text": "yes", "voter_count": 2}, {"text": "no"}],
+                     "total_voter_count": 2, "is_closed": true, "type": "quiz", "correct_option_id": 1},
+            "media_group_id": "g1",
+            "quote": {"text": "part", "position": 0},
+            "reply_to_message": {"message_id": 0, "date": 0, "chat": {"id": 5, "type": "private"},
+                                 "from": {"id": 9, "is_bot": true}, "text": "earlier"},
+            "forward_origin": {"type": "channel", "date": 0,
+                               "chat": {"id": -1, "type": "channel", "title": "News"}},
+            "external_reply": {"origin": {"type": "hidden_user", "date": 0, "sender_user_name": "Ann"},
+                               "photo": [{"file_id": "p", "width": 1, "height": 1}]}
         }))
         .expect("message");
         assert_eq!(m.video.expect("video").file_id, "v");
@@ -881,11 +1018,26 @@ mod split_tests {
             m.audio.expect("audio").file_name.as_deref(),
             Some("song.mp3")
         );
+        let sticker = m.sticker.expect("sticker");
+        assert_eq!(sticker.set_name.as_deref(), Some("cats"));
+        assert!(sticker.is_animated);
+        assert_eq!(sticker.thumbnail.expect("thumbnail").file_id, "t");
+        let poll = m.poll.expect("poll");
+        assert_eq!(poll.options.len(), 2);
+        assert_eq!(poll.options[0].voter_count, 2);
         assert_eq!(
-            m.sticker.expect("sticker").set_name.as_deref(),
-            Some("cats")
+            (poll.kind.as_str(), poll.correct_option_id),
+            ("quiz", Some(1))
         );
-        assert_eq!(m.poll.expect("poll").options.len(), 2);
+        assert_eq!(m.media_group_id.as_deref(), Some("g1"));
+        assert_eq!(m.quote.expect("quote").text, "part");
+        let replied = m.reply_to_message.expect("reply");
+        assert!(replied.from.expect("from").is_bot);
+        let origin = m.forward_origin.expect("forward");
+        assert_eq!(origin.chat.and_then(|c| c.title).as_deref(), Some("News"));
+        let external = m.external_reply.expect("external");
+        assert_eq!(external.origin.sender_user_name.as_deref(), Some("Ann"));
+        assert!(external.content.contains_key("photo"));
     }
 
     fn png(width: u32, height: u32) -> Vec<u8> {
@@ -958,6 +1110,20 @@ mod split_tests {
         assert!(!refused(
             &anyhow::anyhow!("operation timed out").context("sendPhoto request")
         ));
+    }
+
+    #[test]
+    fn an_update_that_cannot_be_read_is_passed_over() {
+        let good = serde_json::json!({"update_id": 7, "message": {
+            "message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"}, "text": "hi"}});
+        let bad = serde_json::json!({"update_id": 8, "message": {"message_id": "x"}});
+        let read = read_update(good).expect("good");
+        assert_eq!(read.update_id, 7);
+        assert!(read.message.is_some());
+        let read = read_update(bad).expect("bad");
+        assert_eq!(read.update_id, 8);
+        assert!(read.message.is_none());
+        assert!(read_update(serde_json::json!({"nothing": 1})).is_none());
     }
 
     #[test]
