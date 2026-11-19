@@ -6,11 +6,14 @@
 //! - upgrade with `X-Adapter-Token` header
 //! - send `ChannelFrame::Inbound` on user message arrival
 //! - receive `ChannelFrame::Outbound` to forward to the platform
-//! - send `ChannelFrame::Resume{since_seq}` on reconnect (until
-//!   havn's Layer D2 ships, gateway warn-drops these — the adapter
-//!   should accept that data is lost across reconnects)
+//! - resume on every connect from the last outbound seq got (`since` in the
+//!   upgrade; across a restart, the last delivered, kept on disk, see
+//!   [`Delivered`]): the gateway replays the replies it kept (5 minutes)
+//!   that came after it, before any new one
 //! - heartbeat via `ChannelFrame::Ping` / `Pong`
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -45,6 +48,124 @@ pub struct WsConfig {
     pub adapter_token: String,
     pub channel_id: String,
     pub account_id: String,
+    pub delivered: Arc<Delivered>,
+}
+
+/// Where the daemon is in the gateway's numbering of its replies (issue
+/// #23): the last one it got, to resume from when it reconnects, and the
+/// last one it delivered, kept in a file so a restart resumes from that.
+#[derive(Debug)]
+pub struct Delivered {
+    path: Option<PathBuf>,
+    account_id: String,
+    got: Mutex<Option<u64>>,
+    /// A write that failed is said once.
+    warned: std::sync::atomic::AtomicBool,
+}
+
+/// What the file holds.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    account_id: String,
+    seq: u64,
+}
+
+impl Delivered {
+    /// The last seq kept at `path` for `account_id`, if any: none for a
+    /// file of another account, or none at all (the first run).
+    pub fn load(path: Option<PathBuf>, account_id: &str) -> Self {
+        let delivered = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<Kept>(&s).ok())
+            .filter(|k| k.account_id == account_id)
+            .map(|k| k.seq);
+        Self {
+            path,
+            account_id: account_id.to_string(),
+            got: Mutex::new(delivered),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The file of `account_id` in `dir`.
+    pub fn file_in(dir: &std::path::Path, account_id: &str) -> PathBuf {
+        let name: String = account_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        dir.join(format!("{name}.state.json"))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        self.got
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Where to resume from on connecting: the last reply got, none on the
+    /// first run, which has nothing to resume (resuming from 0 would send
+    /// again every reply of the last 5 minutes).
+    pub fn since(&self) -> Option<u64> {
+        *self.lock()
+    }
+
+    /// The reply numbered `seq` came from the gateway. The gateway sends a
+    /// connection's replies in order and replays only those after the one
+    /// it resumes from, so one at or before the last got means it numbers
+    /// from somewhere else now (a gateway that counts from 1 restarted, or
+    /// its clock went back): taken all the same, from there on.
+    pub fn got(&self, seq: u64) {
+        let mut got = self.lock();
+        if let Some(last) = *got
+            && seq <= last
+        {
+            warn!(
+                seq,
+                last,
+                "the gateway numbers its replies from an earlier point now (it restarted, or \
+                 its clock went back); delivering them"
+            );
+        }
+        *got = Some(seq);
+    }
+
+    /// The reply numbered `seq` was delivered: kept, the file replaced
+    /// whole so a crash leaves the old one or the new one.
+    pub fn mark(&self, seq: u64) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let kept = Kept {
+            account_id: self.account_id.clone(),
+            seq,
+        };
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let written = serde_json::to_string(&kept)
+            .map_err(std::io::Error::other)
+            .and_then(|body| {
+                std::fs::write(&tmp, body)?;
+                std::fs::rename(&tmp, path)
+            });
+        if let Err(e) = written
+            && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not keep the last reply delivered; a restart will not resume from it \
+                 (set StateDirectory= in the unit, or --state)"
+            );
+        }
+    }
 }
 
 /// Handle held by the daemon to push frames into the WS and read
@@ -52,7 +173,7 @@ pub struct WsConfig {
 /// internally it loops over `connect → run → backoff → reconnect`.
 pub struct WsClient {
     /// Daemon → WS. Send `ChannelFrame::Inbound` (and the rare
-    /// `Resume` / `Ping`) here.
+    /// `Ping`) here.
     pub outbound_tx: mpsc::Sender<ChannelFrame>,
     /// WS → daemon. Receive `ChannelFrame::Outbound` (and rare
     /// `Pong`) here.
@@ -91,10 +212,12 @@ async fn connection_loop(
                     gateway = %cfg.gateway_url,
                     channel = %cfg.channel_id,
                     account = %cfg.account_id,
+                    since = ?cfg.delivered.since(),
                     "havn WS connected"
                 );
                 backoff = RECONNECT_BACKOFF_MIN;
-                let outcome = run_session(ws, &mut outbound_rx, &inbound_tx).await;
+
+                let outcome = run_session(ws, &mut outbound_rx, &inbound_tx, &cfg.delivered).await;
                 match outcome {
                     SessionEnd::OutboundClosed => {
                         info!("havn WS: outbound channel closed; daemon shutting down");
@@ -127,6 +250,12 @@ async fn connect(cfg: &WsConfig) -> Result<WebSocketStream<MaybeTlsStream<TcpStr
         .clear()
         .append_pair("channel", &cfg.channel_id)
         .append_pair("account", &cfg.account_id);
+    // The replies kept for it while it was away come first, before any new
+    // one: the gateway starts the replay as it registers the connection.
+    if let Some(since) = cfg.delivered.since() {
+        url.query_pairs_mut()
+            .append_pair("since", &since.to_string());
+    }
 
     let mut req = url
         .as_str()
@@ -156,6 +285,7 @@ async fn run_session(
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     outbound_rx: &mut mpsc::Receiver<ChannelFrame>,
     inbound_tx: &mpsc::Sender<ChannelFrame>,
+    delivered: &Delivered,
 ) -> SessionEnd {
     let (mut sink, mut stream) = ws.split();
     loop {
@@ -194,6 +324,9 @@ async fn run_session(
                                 continue;
                             }
                         };
+                        if let ChannelFrame::Outbound(o) = &parsed {
+                            delivered.got(o.seq);
+                        }
                         // If the daemon's consumer is gone, EOF the
                         // session — shutdown is in progress.
                         if inbound_tx.send(parsed).await.is_err() {
@@ -207,5 +340,90 @@ async fn run_session(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("havn-tg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_first_run_resumes_from_nothing() {
+        let d = dir("first");
+        let delivered = Delivered::load(Some(Delivered::file_in(&d, "bot")), "bot");
+        assert_eq!(delivered.since(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_restart_resumes_from_the_last_delivered() {
+        let d = dir("restart");
+        let path = Delivered::file_in(&d, "bot");
+        let delivered = Delivered::load(Some(path.clone()), "bot");
+        for seq in [41, 42, 43] {
+            delivered.got(seq);
+        }
+        delivered.mark(41);
+        delivered.mark(42);
+        // A reconnect resumes from the last got: 43 is waiting to go out.
+        assert_eq!(delivered.since(), Some(43));
+        // A restart, from the last delivered: 43 was lost with the process.
+        let again = Delivered::load(Some(path.clone()), "bot");
+        assert_eq!(again.since(), Some(42));
+        // A file of another account is not this one's.
+        assert_eq!(Delivered::load(Some(path), "other").since(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_gateway_numbering_from_earlier_is_followed() {
+        let d = dir("earlier");
+        let path = Delivered::file_in(&d, "bot");
+        let delivered = Delivered::load(Some(path.clone()), "bot");
+        delivered.got(500);
+        delivered.mark(500);
+        // A gateway counting from 1 restarted.
+        delivered.got(1);
+        delivered.mark(1);
+        assert_eq!(delivered.since(), Some(1));
+        assert_eq!(Delivered::load(Some(path), "bot").since(), Some(1));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn accounts_keep_files_of_their_own() {
+        let d = dir("accounts");
+        assert_ne!(Delivered::file_in(&d, "a/b"), Delivered::file_in(&d, "c"));
+        assert_eq!(
+            Delivered::file_in(&d, "../x").file_name().unwrap(),
+            "___x.state.json"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_written_keeps_the_seqs_in_memory() {
+        let delivered = Delivered::load(
+            Some(PathBuf::from("/nonexistent/dir/bot.state.json")),
+            "bot",
+        );
+        delivered.got(5);
+        delivered.mark(5);
+        delivered.mark(6);
+        assert_eq!(delivered.since(), Some(5));
+        let d = dir("garbled");
+        let garbled = d.join("bot.state.json");
+        std::fs::write(&garbled, "not json").unwrap();
+        assert_eq!(Delivered::load(Some(garbled), "bot").since(), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

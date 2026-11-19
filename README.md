@@ -22,13 +22,14 @@ It runs as its own process, apart from the gateway, and talks to it over the gat
 - **The command menu.** The bot's `/` menu is set from the commands the gateway offers (`/new`, `/stop`, `/retry`, `/model`, ...), whenever the daemon connects.
 - **Long replies** are split into several messages at paragraph, line or word breaks, in order, under Telegram's 4096 characters each; a code block cut in two is closed and opened again, so both parts show as code. When Telegram asks the bot to slow down, a part is sent again after the wait; if a part still cannot be sent, the person is told the rest did not come.
 - **Kinds it cannot pass on** (a dice roll, a game, a story, paid media, a checklist) reach the gateway as a note, so a sender who is not paired is answered and the agent can tell one who is. Service messages (a pin, a timer change) are ignored.
+- **Replies missed while disconnected.** When the daemon reconnects to the gateway, after the gateway or the daemon restarted or the connection dropped, it gets the replies sent meanwhile that the gateway kept (the last 5 minutes), in order, before any new one. It keeps the last reply it delivered in `<account_id>.state.json` in the unit's `StateDirectory` (or next to the config file, or at `--state`), so a restart resumes too. A reply is delivered twice only if the daemon stops between sending it and keeping it.
 - **Long polling** (`getUpdates`): no public address, domain or certificate is needed.
 
 Who may use the bot, what the commands do and how chats work is decided by the gateway: see [Channel Adapters](https://github.com/amplimit/havn#channel-adapters), [Chat commands](https://github.com/amplimit/havn#chat-commands) and [Invite codes](https://github.com/amplimit/havn#invite-codes) in the Havn README.
 
 ## Requirements
 
-- A Havn gateway, 0.2.2 or later for the command menu (`havn --version`).
+- A Havn gateway, 0.2.2 or later for the command menu and 0.2.7 or later for replies missed while disconnected (`havn --version`).
 - A Telegram bot: create one with [@BotFather](https://t.me/BotFather) (`/newbot`) and keep its token (`1234567890:AAH...`).
 - Rust, to build the daemon.
 
@@ -110,6 +111,8 @@ ExecStart=/usr/local/bin/havn-channel-telegram --config /etc/havn-channel-telegr
 Restart=always
 RestartSec=5
 User=havn-tg
+# Where it keeps the last reply delivered, to resume after a restart.
+StateDirectory=havn-channel-telegram
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -156,7 +159,6 @@ If it does not answer:
 - Private chats only; groups, supergroups and channels are dropped.
 - An edited message is not passed on: the agent answered the original, and acting on edits would repeat its work. Send a new message instead.
 - A voice message that cannot be downloaded from Telegram reaches the agent only as a note asking for it again.
-- Replies the agent sends while the daemon is disconnected from the gateway are lost: the gateway keeps them for 5 minutes, but this daemon does not ask for them yet when it reconnects.
 - Images in a reply that are not files the agent sent are shown as text (`[image: <url>]`).
 - A location, a place or a contact is passed on as such, without the line saying what it replies to or who it was forwarded from.
 - Long polling only, no webhook.
