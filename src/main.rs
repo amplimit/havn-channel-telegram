@@ -25,7 +25,6 @@ mod havn_ws;
 mod markdown;
 mod telegram;
 mod types;
-mod whisper;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -48,7 +47,6 @@ use crate::telegram::Telegram;
 use crate::types::{
     Attachment, ChannelFrame, ChannelInbound, ChannelMessageContent, ChannelOutbound,
 };
-use crate::whisper::Whisper;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,20 +82,16 @@ async fn main() -> Result<()> {
 
     let telegram =
         Telegram::new(&cfg.bot_token, cfg.poll_timeout_seconds).context("Telegram client init")?;
-    let whisper = match cfg.openai_api_key.as_ref() {
-        Some(k) if !k.is_empty() => Some(
-            Whisper::new(
-                k.clone(),
-                cfg.whisper_base_url.clone(),
-                cfg.whisper_model.clone(),
-            )
-            .context("Whisper init")?,
-        ),
-        _ => {
-            info!("no openai_api_key configured — voice messages will be dropped");
-            None
-        }
-    };
+    // Voice messages go to the gateway, which transcribes them (havn
+    // issue #164).
+    if cfg.openai_api_key.is_some() || cfg.whisper_base_url.is_some() || cfg.whisper_model.is_some()
+    {
+        warn!(
+            "openai_api_key, whisper_base_url and whisper_model are no longer used: voice \
+             messages go to the gateway, which transcribes them with [transcription] in its \
+             config.toml"
+        );
+    }
     let gateway = Gateway::new(
         &cfg.havn_gateway,
         &cfg.adapter_token,
@@ -130,7 +124,6 @@ async fn main() -> Result<()> {
     // Telegram getUpdates is naturally restartable.
     let inbound_task = tokio::spawn(telegram_inbound_loop(
         telegram.clone(),
-        whisper.clone(),
         gateway.clone(),
         outbound_tx.clone(),
         cfg.account_id.clone(),
@@ -170,7 +163,6 @@ fn init_tracing() {
 /// sufficient.
 async fn telegram_inbound_loop(
     tg: Telegram,
-    whisper: Option<Whisper>,
     gateway: Gateway,
     outbound_tx: tokio::sync::mpsc::Sender<ChannelFrame>,
     account_id: String,
@@ -269,7 +261,7 @@ async fn telegram_inbound_loop(
         ready.extend(albums.take_quiet(std::time::Instant::now()));
         for msgs in ready {
             let chat_id = msgs[0].chat.id;
-            let frame = translate(&msgs, &tg, whisper.as_ref(), &gateway, &account_id, &seq).await;
+            let frame = translate(&msgs, &tg, &gateway, &account_id, &seq).await;
             // A service message gets no reply.
             if frame.is_none() {
                 typing.replied(chat_id);
@@ -378,7 +370,6 @@ impl Albums {
 async fn translate(
     msgs: &[telegram::Message],
     tg: &Telegram,
-    whisper: Option<&Whisper>,
     gateway: &Gateway,
     account_id: &str,
     seq: &Arc<AtomicU64>,
@@ -404,16 +395,7 @@ async fn translate(
     // the only overlap (it includes both location and venue fields).
     let content = if let Some(voice) = &msg.voice {
         let caption = msg.caption.as_deref();
-        translate_voice(
-            tg,
-            whisper,
-            gateway,
-            &sender_id,
-            voice,
-            caption,
-            &mut attachments,
-        )
-        .await
+        translate_voice(tg, gateway, &sender_id, voice, caption, &mut attachments).await
     } else if let Some(venue) = &msg.venue {
         ChannelMessageContent::Location {
             latitude: venue.location.latitude,
@@ -937,13 +919,11 @@ fn failure(e: &anyhow::Error) -> &'static str {
     }
 }
 
-/// A Telegram voice message, for the agent: its transcript, through the
-/// Whisper API when one is configured; otherwise, or when transcription
-/// fails, the voice message itself as an audio file, with a note saying
-/// why. Never dropped.
+/// A Telegram voice message, for the agent: the audio file, which the
+/// gateway transcribes when it is set up to (havn issue #164), with a line
+/// saying what it is. Never dropped.
 async fn translate_voice(
     tg: &Telegram,
-    whisper: Option<&Whisper>,
     gateway: &Gateway,
     sender_id: &str,
     voice: &telegram::Voice,
@@ -951,60 +931,24 @@ async fn translate_voice(
     attachments: &mut Vec<Attachment>,
 ) -> ChannelMessageContent {
     let caption = caption.filter(|c| !c.trim().is_empty());
-    let audio = match tg.get_file(&voice.file_id).await {
-        Ok(path) => tg.download_file(&path).await,
-        Err(e) => Err(e),
-    };
-    let audio = match audio {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(file_id = %voice.file_id, error = %format!("{e:#}"), "could not download a voice message");
-            return ChannelMessageContent::Text {
-                text: "[The sender sent a voice message that could not be downloaded. Ask them to \
-                       send it again, or as text.]"
-                    .to_string(),
-            };
-        }
-    };
-    let why = match whisper {
-        None => "no transcription is set up for this bot",
-        Some(whisper) => match whisper.transcribe(audio.clone(), "voice.ogg").await {
-            Ok(transcript) => {
-                debug!(
-                    duration = voice.duration,
-                    bytes = audio.len(),
-                    transcript_len = transcript.len(),
-                    "telegram voice → whisper transcript"
-                );
-                // Not the file's URL: it holds the bot token.
-                return ChannelMessageContent::Audio {
-                    transcript: match caption {
-                        Some(caption) => format!("{caption}\n\n{transcript}"),
-                        None => transcript,
-                    },
-                    duration_seconds: Some(voice.duration),
-                    url: None,
-                };
-            }
-            Err(e) => {
-                warn!(file_id = %voice.file_id, error = %format!("{e:#}"), "whisper transcription failed");
-                "it could not be transcribed"
-            }
-        },
-    };
-    let received = gateway
-        .upload(sender_id, "voice.ogg", "audio/ogg", audio)
-        .await;
-    // Says "attached" only when it was; `file_message` adds why not.
-    let attached = if received.is_ok() {
-        ", attached as voice.ogg"
+    let received = receive_file(
+        tg,
+        gateway,
+        sender_id,
+        &voice.file_id,
+        "voice.ogg",
+        "audio/ogg",
+    )
+    .await;
+    let transcribed = received.as_ref().is_ok_and(|a| a.transcript.is_some());
+    let mut note = if transcribed {
+        format!("[A voice message of {} seconds.]", voice.duration)
     } else {
-        ""
+        format!(
+            "[A voice message of {} seconds; it was not transcribed.]",
+            voice.duration
+        )
     };
-    let mut note = format!(
-        "[A voice message of {} seconds{attached}; {why}.]",
-        voice.duration
-    );
     if let Some(caption) = caption {
         note = format!("{caption}\n\n{note}");
     }

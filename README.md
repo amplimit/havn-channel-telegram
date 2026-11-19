@@ -7,7 +7,7 @@ It runs as its own process, apart from the gateway, and talks to it over the gat
 ## What it does
 
 - **Private chats** with the bot (1:1). Messages in groups, supergroups and channels are dropped.
-- **Text**, and **voice messages** transcribed with an OpenAI-compatible Whisper API when one is configured; otherwise, or when transcription fails, the voice message reaches the agent as an audio file with a note saying why.
+- **Text**, and **voice messages**: a voice message goes to the gateway as an audio file (`voice.ogg`), which the gateway transcribes when `[transcription]` is set in its config.toml (see [Voice messages](https://github.com/amplimit/havn#voice-messages) in the Havn README); the agent gets the transcript with the file, or a line saying it was not transcribed. Audio files are passed on the same way.
 - **Locations, venues and contacts**, passed to the agent as such.
 - **Stickers**: their emoji and set as text, and their picture as an image the agent can see when its model takes images. A sticker that moves (animated or video) gives its thumbnail; without one, or if the picture cannot be fetched, only the text comes. A sticker a person sends again is not saved again (the last 256 are remembered while the daemon runs).
 - **Polls**: the question, whether it is a quiz, open or closed and takes one or several answers, the votes in all, and each option with its votes (and the correct one of a quiz, when Telegram tells the bot).
@@ -94,12 +94,6 @@ account_id    = "acme-bot"                  # the account's id
 
 # Seconds Telegram holds a long poll open (at most 50; default 25).
 poll_timeout_seconds = 25
-
-# Voice messages, transcribed with an OpenAI-compatible Whisper API.
-# Without a key, voice messages are dropped.
-# openai_api_key   = "..."
-# whisper_base_url = "https://api.groq.com/openai/v1"   # default: OpenAI
-# whisper_model    = "whisper-large-v3-turbo"           # default: whisper-1
 ```
 
 ### 5. Run it under systemd

@@ -45,26 +45,12 @@ pub struct Config {
     #[serde(default = "default_poll_timeout")]
     pub poll_timeout_seconds: u64,
 
-    /// OpenAI-compatible API key for Whisper STT. Optional —
-    /// daemons that don't need to transcribe voice (text-only bots)
-    /// leave it unset and any inbound voice message gets dropped
-    /// with a warn. The key never leaves this daemon's process;
-    /// havn never sees it.
+    /// No longer used: voice messages go to the gateway, which
+    /// transcribes them (havn issue #164). Read only to warn about them.
     #[serde(default)]
     pub openai_api_key: Option<String>,
-
-    /// Override the Whisper endpoint (default
-    /// `https://api.openai.com/v1`). Operators with a self-hosted
-    /// whisper.cpp + openai-shim, Groq, or other OpenAI-compatible
-    /// STT provider set this. Empty/unset uses `OpenAI`.
     #[serde(default)]
     pub whisper_base_url: Option<String>,
-
-    /// Override the Whisper model name (default `whisper-1`). `OpenAI`
-    /// also offers `gpt-4o-transcribe`; Groq uses
-    /// `whisper-large-v3` / `whisper-large-v3-turbo`; etc.
-    /// Matches whatever the configured provider accepts at
-    /// `POST /audio/transcriptions`'s `model` field.
     #[serde(default)]
     pub whisper_model: Option<String>,
 }
@@ -79,10 +65,10 @@ fn default_poll_timeout() -> u64 {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Self = toml::from_str(&raw)
-            .with_context(|| format!("parsing {} as TOML", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: Self =
+            toml::from_str(&raw).with_context(|| format!("parsing {} as TOML", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }

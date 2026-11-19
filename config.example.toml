@@ -8,7 +8,3 @@ channel_id           = "telegram"
 account_id           = "my-tg-bot"
 poll_timeout_seconds = 25
 
-# Optional: Whisper STT for voice messages.
-# openai_api_key   = "YOUR_WHISPER_API_KEY"
-# whisper_base_url = "https://api.groq.com/openai/v1"
-# whisper_model    = "whisper-large-v3-turbo"
