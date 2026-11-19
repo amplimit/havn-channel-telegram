@@ -64,6 +64,11 @@ struct Cli {
         default_value = "/etc/havn-channel-telegram/config.toml"
     )]
     config: PathBuf,
+    /// Where the daemon keeps the last reply it delivered, to resume from
+    /// after a restart. Defaults to `<account_id>.state.json` in systemd's
+    /// `StateDirectory`, else next to the config file.
+    #[arg(long, env = "HAVN_TG_STATE")]
+    state: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -106,11 +111,24 @@ async fn main() -> Result<()> {
             Box::pin(async move { tg.send_typing(chat_id).await })
         })
     };
+    // The last reply delivered, to resume from (issue #23).
+    let state = cli.state.clone().or_else(|| {
+        // systemd sets it to the unit's StateDirectory (the first, when
+        // there are several).
+        let dir = std::env::var("STATE_DIRECTORY")
+            .ok()
+            .and_then(|dirs| dirs.split(':').next().map(PathBuf::from))
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .or_else(|| cli.config.parent().map(std::path::Path::to_path_buf))?;
+        Some(havn_ws::Delivered::file_in(&dir, &cfg.account_id))
+    });
+    let delivered = Arc::new(havn_ws::Delivered::load(state, &cfg.account_id));
     let ws = WsClient::spawn(WsConfig {
         gateway_url: cfg.havn_gateway.clone(),
         adapter_token: cfg.adapter_token.clone(),
         channel_id: cfg.channel_id.clone(),
         account_id: cfg.account_id.clone(),
+        delivered: Arc::clone(&delivered),
     });
 
     let WsClient {
@@ -134,6 +152,7 @@ async fn main() -> Result<()> {
         gateway,
         inbound_rx,
         typing,
+        delivered,
     ));
 
     // Wait for shutdown signal. Dropping `outbound_tx` triggers
@@ -1212,6 +1231,7 @@ async fn havn_outbound_loop(
     gateway: Gateway,
     mut inbound_rx: tokio::sync::mpsc::Receiver<ChannelFrame>,
     typing: Typing,
+    delivered: Arc<havn_ws::Delivered>,
 ) -> Result<()> {
     // The menu last set, so a reconnect does not set it again.
     let mut menu: Option<Vec<types::ChannelCommand>> = None;
@@ -1236,6 +1256,7 @@ async fn havn_outbound_loop(
                 if let Err(e) = deliver_outbound(&tg, &gateway, &o).await {
                     warn!(error = %e, seq = o.seq, "telegram sendMessage failed; dropping");
                 }
+                delivered.mark(o.seq);
                 // A reply came: a file (as some replies are) or text. A
                 // part of one has more to come, so typing shows on.
                 if let Some(chat_id) = chat_of(&o.to) {
