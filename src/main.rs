@@ -205,6 +205,15 @@ async fn telegram_inbound_loop(
             // A button press (havn issue #203) goes on as the person who
             // pressed it sending the button's data; Telegram is told it was
             // taken, and the buttons come off so they are pressed once.
+            if let Some(vote) = update.poll_answer {
+                let Some(msg) = vote_message(&tg, &vote) else {
+                    continue;
+                };
+                ready.extend(albums.take_chat(msg.chat.id));
+                typing.start(msg.chat.id);
+                ready.push(vec![msg]);
+                continue;
+            }
             let msg = match (update.message, update.callback_query) {
                 (Some(msg), _) => msg,
                 (None, Some(press)) => {
@@ -1307,6 +1316,72 @@ async fn havn_outbound_loop(
     Ok(())
 }
 
+/// The bot's open polls (havn issue #204), by poll id: their chat, message
+/// and what a vote sends back.
+static POLLS: std::sync::LazyLock<Mutex<Polls>> =
+    std::sync::LazyLock::new(|| Mutex::new(Polls::default()));
+
+/// How many open polls are remembered; past that, the oldest go.
+const POLLS_KEPT: usize = 256;
+
+#[derive(Default)]
+struct Polls {
+    open: HashMap<String, (i64, i64, String)>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl Polls {
+    fn put(&mut self, poll_id: String, chat_id: i64, message_id: i64, answer: String) {
+        if self
+            .open
+            .insert(poll_id.clone(), (chat_id, message_id, answer))
+            .is_none()
+        {
+            self.order.push_back(poll_id);
+        }
+        while self.order.len() > POLLS_KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.open.remove(&oldest);
+            }
+        }
+    }
+
+    fn take(&mut self, poll_id: &str) -> Option<(i64, i64, String)> {
+        let taken = self.open.remove(poll_id)?;
+        self.order.retain(|id| id != poll_id);
+        Some(taken)
+    }
+}
+
+/// A vote in one of the bot's polls as a message from the person who
+/// voted, its text the poll's answer and the numbers chosen; the poll is
+/// closed, so it is answered once. `None` for a poll the bot does not
+/// know (asked before a restart) or a vote taken back.
+fn vote_message(tg: &Telegram, vote: &telegram::PollAnswer) -> Option<telegram::Message> {
+    if vote.option_ids.is_empty() {
+        return None;
+    }
+    let from = vote.user.clone()?;
+    let (chat_id, message_id, answer) = POLLS.lock().ok()?.take(&vote.poll_id)?;
+    let numbers: Vec<String> = vote
+        .option_ids
+        .iter()
+        .map(|n| (n + 1).to_string())
+        .collect();
+    let tg = tg.clone();
+    tokio::spawn(async move { tg.stop_poll(chat_id, message_id).await });
+    let chat: telegram::Chat = serde_json::from_value(serde_json::json!({
+        "id": chat_id, "type": "private"
+    }))
+    .ok()?;
+    Some(telegram::Message {
+        from: Some(from),
+        text: Some(format!("{answer} {}", numbers.join(","))),
+        date: chrono::Utc::now().timestamp(),
+        ..telegram::Message::bare(message_id, chat)
+    })
+}
+
 /// The chat of an outbound `to` (`tg:<chat_id>`).
 fn chat_of(to: &str) -> Option<i64> {
     to.strip_prefix("tg:")?.parse().ok()
@@ -1317,6 +1392,20 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
         .ok_or_else(|| anyhow::anyhow!("outbound `to` not in tg:<id> format: {:?}", o.to))?;
 
     let reply_to_message_id = o.in_reply_to.as_deref().and_then(parse_message_id);
+
+    // A question of several answers goes as a poll; its text, if the poll
+    // is refused.
+    if let Some(poll) = &o.poll {
+        match tg.send_poll(chat_id, &poll.question, &poll.options).await {
+            Ok((poll_id, message_id)) => {
+                if let Ok(mut polls) = POLLS.lock() {
+                    polls.put(poll_id, chat_id, message_id, poll.answer.clone());
+                }
+                return Ok(());
+            }
+            Err(e) => warn!(error = %format!("{e:#}"), "telegram refused a poll; sending its text"),
+        }
+    }
 
     let text = match &o.content {
         ChannelMessageContent::Text { text } => text.clone(),
@@ -1656,6 +1745,29 @@ mod tests {
         let full = albums.add("full".into(), 9 + 100, part(9, "full", 5), now);
         assert_eq!(full.map(|parts| parts.len()), Some(ALBUM_PARTS));
         assert!(albums.is_empty());
+    }
+
+    #[test]
+    fn open_polls_are_remembered_up_to_a_limit() {
+        let mut polls = Polls::default();
+        for n in 0..=POLLS_KEPT {
+            polls.put(
+                format!("p{n}"),
+                5,
+                i64::try_from(n).expect("n"),
+                "/choose q".into(),
+            );
+        }
+        assert!(polls.take("p0").is_none(), "the oldest went");
+        assert_eq!(
+            polls.take(&format!("p{POLLS_KEPT}")),
+            Some((
+                5,
+                i64::try_from(POLLS_KEPT).expect("n"),
+                "/choose q".to_string()
+            ))
+        );
+        assert!(polls.take(&format!("p{POLLS_KEPT}")).is_none(), "once");
     }
 
     #[test]

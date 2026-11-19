@@ -69,7 +69,7 @@ impl Telegram {
                 // only in v0.2. Future expansion can widen this.
                 (
                     "allowed_updates",
-                    "[\"message\",\"callback_query\"]".to_string(),
+                    "[\"message\",\"callback_query\",\"poll_answer\"]".to_string(),
                 ),
             ])
             .send()
@@ -306,6 +306,62 @@ impl Telegram {
         let body = serde_json::json!({ "callback_query_id": press_id });
         if let Err(e) = self.http.post(&url).json(&body).send().await {
             tracing::debug!(error = %e.without_url(), "answerCallbackQuery failed (non-fatal)");
+        }
+    }
+
+    /// Send a poll of several answers that is not anonymous, so each vote
+    /// comes as a `poll_answer`: its poll id and message id.
+    pub async fn send_poll(
+        &self,
+        chat_id: i64,
+        question: &str,
+        options: &[String],
+    ) -> Result<(String, i64)> {
+        let url = format!("{}/sendPoll", self.base);
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "question": question,
+            "options": options.iter().map(|o| serde_json::json!({ "text": o })).collect::<Vec<_>>(),
+            "is_anonymous": false,
+            "allows_multiple_answers": true,
+        });
+        let resp: ApiResponse<serde_json::Value> = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("sendPoll request")?
+            .json()
+            .await
+            .context("sendPoll body parse")?;
+        if !resp.ok {
+            anyhow::bail!(
+                "telegram sendPoll returned ok=false: {}",
+                resp.description.unwrap_or_default()
+            );
+        }
+        let sent = resp.result.context("sendPoll without a message")?;
+        let poll_id = sent
+            .pointer("/poll/id")
+            .and_then(serde_json::Value::as_str)
+            .context("sendPoll without a poll id")?
+            .to_string();
+        let message_id = sent
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .context("sendPoll without a message id")?;
+        Ok((poll_id, message_id))
+    }
+
+    /// Close poll message `message_id`, so it is answered once.
+    /// Best-effort.
+    pub async fn stop_poll(&self, chat_id: i64, message_id: i64) {
+        let url = format!("{}/stopPoll", self.base);
+        let body = serde_json::json!({ "chat_id": chat_id, "message_id": message_id });
+        if let Err(e) = self.http.post(&url).json(&body).send().await {
+            tracing::debug!(error = %e.without_url(), "stopPoll failed (non-fatal)");
         }
     }
 
@@ -617,6 +673,7 @@ fn read_update(value: serde_json::Value) -> Option<Update> {
                 update_id,
                 message: None,
                 callback_query: None,
+                poll_answer: None,
             })
         }
     }
@@ -631,6 +688,19 @@ pub struct Update {
     /// A press of a button under one of the bot's messages.
     #[serde(default)]
     pub callback_query: Option<CallbackQuery>,
+    /// A vote in one of the bot's polls.
+    #[serde(default)]
+    pub poll_answer: Option<PollAnswer>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PollAnswer {
+    pub poll_id: String,
+    #[serde(default)]
+    pub user: Option<TelegramUser>,
+    /// The options chosen, from 0; none when the vote was taken back.
+    #[serde(default)]
+    pub option_ids: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1272,6 +1342,19 @@ mod split_tests {
             serde_json::from_value(serde_json::json!({"id": "q3", "from": {"id": 1}}))
                 .expect("press");
         assert!(empty.as_message().is_none());
+    }
+
+    #[test]
+    fn a_vote_is_read() {
+        let update: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 3,
+            "poll_answer": {"poll_id": "p9", "user": {"id": 42}, "option_ids": [0, 2]}
+        }))
+        .expect("update");
+        let vote = update.poll_answer.expect("vote");
+        assert_eq!(vote.poll_id, "p9");
+        assert_eq!(vote.option_ids, [0, 2]);
+        assert_eq!(vote.user.expect("user").id, 42);
     }
 
     #[test]
