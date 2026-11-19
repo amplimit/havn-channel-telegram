@@ -67,7 +67,10 @@ impl Telegram {
                 // Don't request `edited_message` / `channel_post` /
                 // `inline_query` — agents respond to direct messages
                 // only in v0.2. Future expansion can widen this.
-                ("allowed_updates", "[\"message\"]".to_string()),
+                (
+                    "allowed_updates",
+                    "[\"message\",\"callback_query\"]".to_string(),
+                ),
             ])
             .send()
             .await
@@ -238,6 +241,7 @@ impl Telegram {
         text: &str,
         html: bool,
         reply_to_message_id: Option<i64>,
+        buttons: &[Vec<crate::types::Button>],
     ) -> Result<()> {
         let url = format!("{}/sendMessage", self.base);
         let mut body = serde_json::json!({
@@ -246,6 +250,9 @@ impl Telegram {
         });
         if html {
             body["parse_mode"] = serde_json::json!("HTML");
+        }
+        if !buttons.is_empty() {
+            body["reply_markup"] = keyboard(buttons);
         }
         if let Some(rt) = reply_to_message_id {
             body["reply_to_message_id"] = serde_json::json!(rt);
@@ -292,6 +299,30 @@ impl Telegram {
 }
 
 impl Telegram {
+    /// Tell Telegram a button press was taken, so the person's app stops
+    /// waiting on it. Best-effort.
+    pub async fn answer_press(&self, press_id: &str) {
+        let url = format!("{}/answerCallbackQuery", self.base);
+        let body = serde_json::json!({ "callback_query_id": press_id });
+        if let Err(e) = self.http.post(&url).json(&body).send().await {
+            tracing::debug!(error = %e.without_url(), "answerCallbackQuery failed (non-fatal)");
+        }
+    }
+
+    /// Take the buttons off message `message_id`, so they are pressed once.
+    /// Best-effort.
+    pub async fn clear_buttons(&self, chat_id: i64, message_id: i64) {
+        let url = format!("{}/editMessageReplyMarkup", self.base);
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": { "inline_keyboard": [] },
+        });
+        if let Err(e) = self.http.post(&url).json(&body).send().await {
+            tracing::debug!(error = %e.without_url(), "editMessageReplyMarkup failed (non-fatal)");
+        }
+    }
+
     /// Set the bot's command menu (`setMyCommands`) to `commands`: those
     /// Telegram takes (a name of 1-32 lowercase letters, digits and `_`,
     /// a description of 1-256 characters), at most 100. How many were set.
@@ -321,6 +352,22 @@ impl Telegram {
         }
         Ok(menu.len())
     }
+}
+
+/// `buttons` as Telegram's inline keyboard: a press sends back the
+/// button's `data` (at most 64 bytes, which the gateway keeps to).
+fn keyboard(buttons: &[Vec<crate::types::Button>]) -> serde_json::Value {
+    let rows: Vec<Vec<serde_json::Value>> = buttons
+        .iter()
+        .map(|row| {
+            row.iter()
+                .filter(|b| !b.data.is_empty() && b.data.len() <= 64)
+                .map(|b| serde_json::json!({ "text": b.label, "callback_data": b.data }))
+                .collect()
+        })
+        .filter(|row: &Vec<serde_json::Value>| !row.is_empty())
+        .collect();
+    serde_json::json!({ "inline_keyboard": rows })
 }
 
 /// The entries of `commands` Telegram's menu takes, as it takes them.
@@ -569,16 +616,48 @@ fn read_update(value: serde_json::Value) -> Option<Update> {
             Some(Update {
                 update_id,
                 message: None,
+                callback_query: None,
             })
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
+    /// A press of a button under one of the bot's messages.
+    #[serde(default)]
+    pub callback_query: Option<CallbackQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub from: TelegramUser,
+    /// The message the button is under; only its chat and id when it is
+    /// too old for the bot to read.
+    #[serde(default)]
+    pub message: Option<Message>,
+    #[serde(default)]
+    pub data: Option<String>,
+}
+
+impl CallbackQuery {
+    /// The press as a message from the person who pressed it, its text the
+    /// button's data, in the chat of the message the button is under.
+    pub fn as_message(&self) -> Option<Message> {
+        let under = self.message.as_ref()?;
+        let data = self.data.as_ref().filter(|d| !d.is_empty())?;
+        Some(Message {
+            from: Some(self.from.clone()),
+            text: Some(data.clone()),
+            date: chrono::Utc::now().timestamp(),
+            ..Message::bare(under.message_id, under.chat.clone())
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -656,6 +735,40 @@ pub struct Message {
 }
 
 impl Message {
+    /// A message with nothing in it, of chat `chat`.
+    pub fn bare(message_id: i64, chat: Chat) -> Self {
+        Self {
+            message_id,
+            from: None,
+            chat,
+            date: 0,
+            text: None,
+            voice: None,
+            location: None,
+            venue: None,
+            contact: None,
+            photo: None,
+            document: None,
+            caption: None,
+            video: None,
+            video_note: None,
+            audio: None,
+            sticker: None,
+            animation: None,
+            poll: None,
+            dice: None,
+            game: None,
+            story: None,
+            paid_media: None,
+            checklist: None,
+            media_group_id: None,
+            reply_to_message: None,
+            quote: None,
+            external_reply: None,
+            forward_origin: None,
+        }
+    }
+
     /// Whether it is a kind of message a person sent on purpose that this
     /// bot cannot pass on (not a service message such as a pin).
     #[must_use]
@@ -1124,6 +1237,61 @@ mod split_tests {
         assert_eq!(read.update_id, 8);
         assert!(read.message.is_none());
         assert!(read_update(serde_json::json!({"nothing": 1})).is_none());
+    }
+
+    #[test]
+    fn a_press_reads_as_its_sender_writing_its_data() {
+        let update: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 9,
+            "callback_query": {
+                "id": "q1", "from": {"id": 42, "first_name": "Ann"},
+                "message": {"message_id": 77, "date": 0, "chat": {"id": 42, "type": "private"},
+                            "text": "A step waits for approval"},
+                "data": "/approve r1"
+            }
+        }))
+        .expect("update");
+        let press = update.callback_query.expect("press");
+        let m = press.as_message().expect("message");
+        assert_eq!(m.text.as_deref(), Some("/approve r1"));
+        assert_eq!(m.from.expect("from").id, 42);
+        assert_eq!((m.chat.id, m.message_id), (42, 77));
+        assert!(m.reply_to_message.is_none());
+        // Too old to read: only the chat and id come, which is enough.
+        let old: CallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": "q2", "from": {"id": 42},
+            "message": {"message_id": 5, "date": 0, "chat": {"id": 42, "type": "private"}},
+            "data": "/deny r1"
+        }))
+        .expect("press");
+        assert_eq!(
+            old.as_message().expect("message").text.as_deref(),
+            Some("/deny r1")
+        );
+        let empty: CallbackQuery =
+            serde_json::from_value(serde_json::json!({"id": "q3", "from": {"id": 1}}))
+                .expect("press");
+        assert!(empty.as_message().is_none());
+    }
+
+    #[test]
+    fn buttons_become_an_inline_keyboard() {
+        let b = |label: &str, data: &str| crate::types::Button {
+            label: label.into(),
+            data: data.into(),
+        };
+        let markup = keyboard(&[
+            vec![b("Approve", "/approve r1"), b("Too long", &"x".repeat(65))],
+            vec![b("Empty", "")],
+            vec![b("Deny", "/deny r1")],
+        ]);
+        assert_eq!(
+            markup,
+            serde_json::json!({"inline_keyboard": [
+                [{"text": "Approve", "callback_data": "/approve r1"}],
+                [{"text": "Deny", "callback_data": "/deny r1"}]
+            ]})
+        );
     }
 
     #[test]

@@ -202,8 +202,27 @@ async fn telegram_inbound_loop(
                 continue;
             }
             next = update.update_id + 1;
-            let Some(msg) = update.message else {
-                continue;
+            // A button press (havn issue #203) goes on as the person who
+            // pressed it sending the button's data; Telegram is told it was
+            // taken, and the buttons come off so they are pressed once.
+            let msg = match (update.message, update.callback_query) {
+                (Some(msg), _) => msg,
+                (None, Some(press)) => {
+                    let pressed = press.as_message();
+                    let tg = tg.clone();
+                    let under = press.message.as_ref().map(|m| (m.chat.id, m.message_id));
+                    tokio::spawn(async move {
+                        tg.answer_press(&press.id).await;
+                        if let Some((chat_id, message_id)) = under {
+                            tg.clear_buttons(chat_id, message_id).await;
+                        }
+                    });
+                    let Some(msg) = pressed else {
+                        continue;
+                    };
+                    msg
+                }
+                (None, None) => continue,
             };
             let private = msg.chat.kind == "private";
             // Typing shows from before translate (which may do STT) until
@@ -987,16 +1006,32 @@ async fn translate_voice(
 /// messages as Telegram's limit takes; the first replies to `reply_to`.
 /// When a part cannot be sent after the first, the person is told the
 /// rest did not come.
-async fn send_text(tg: &Telegram, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
+async fn send_text(
+    tg: &Telegram,
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+    buttons: &[Vec<types::Button>],
+) -> Result<()> {
     let parts = markdown::split(text, telegram::MESSAGE_UNITS);
     for (n, part) in parts.iter().enumerate() {
-        if let Err(e) = send_part(tg, chat_id, part, if n == 0 { reply_to } else { None }).await {
+        // The buttons go under the last part.
+        let under = if n + 1 == parts.len() { buttons } else { &[] };
+        if let Err(e) = send_part(
+            tg,
+            chat_id,
+            part,
+            if n == 0 { reply_to } else { None },
+            under,
+        )
+        .await
+        {
             if n > 0 {
                 let note = format!(
                     "(The rest of this reply, {} more part(s), could not be delivered.)",
                     parts.len() - n
                 );
-                let _ = tg.send_message(chat_id, &note, false, None).await;
+                let _ = tg.send_message(chat_id, &note, false, None, &[]).await;
             }
             return Err(e);
         }
@@ -1012,22 +1047,31 @@ async fn send_part(
     chat_id: i64,
     markdown: &str,
     reply_to: Option<i64>,
+    buttons: &[Vec<types::Button>],
 ) -> Result<()> {
     let html = markdown::to_html(markdown);
     if (1..=telegram::MESSAGE_UNITS).contains(&markdown::visible_units(&html)) {
-        match tg.send_message(chat_id, &html, true, reply_to).await {
+        match tg
+            .send_message(chat_id, &html, true, reply_to, buttons)
+            .await
+        {
             Err(e) if telegram::refused_markup(&e) => {
                 warn!(error = %e, "telegram refused a reply's formatting; sending it as plain text");
             }
             sent => return sent,
         }
     }
-    for (n, piece) in telegram::split_text(markdown, telegram::MESSAGE_UNITS)
-        .iter()
-        .enumerate()
-    {
-        tg.send_message(chat_id, piece, false, if n == 0 { reply_to } else { None })
-            .await?;
+    let pieces = telegram::split_text(markdown, telegram::MESSAGE_UNITS);
+    for (n, piece) in pieces.iter().enumerate() {
+        let under = if n + 1 == pieces.len() { buttons } else { &[] };
+        tg.send_message(
+            chat_id,
+            piece,
+            false,
+            if n == 0 { reply_to } else { None },
+            under,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1090,7 +1134,7 @@ async fn send_file(
         rest = Some(more);
     }
     if let Some(rest) = rest {
-        send_text(tg, chat_id, &rest, None).await?;
+        send_text(tg, chat_id, &rest, None, &[]).await?;
     }
     Ok(())
 }
@@ -1354,7 +1398,7 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
         // when added.
     };
 
-    send_text(tg, chat_id, &text, reply_to_message_id).await
+    send_text(tg, chat_id, &text, reply_to_message_id, &o.buttons).await
 }
 
 /// Parse a `channel_message_id` of the form `tg:chat:<chat>:msg:<msg>`
