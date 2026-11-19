@@ -177,9 +177,14 @@ async fn telegram_inbound_loop(
     typing: Typing,
 ) -> Result<()> {
     let seq = Arc::new(AtomicU64::new(1));
-    let mut offset: i64 = 0;
+    // The next update not seen yet. Telegram forgets the updates before
+    // the offset a poll gives, so while album parts wait, polls give the
+    // first of them: a restart then gets them again (seen ones are passed
+    // over until then).
+    let mut next: i64 = 0;
     let mut albums = Albums::default();
     loop {
+        let offset = albums.first_update().map_or(next, |first| first.min(next));
         // While an album waits for its parts, polls are brief, so it goes
         // on soon after its last part.
         let updates = match tg.get_updates(offset, !albums.is_empty()).await {
@@ -193,7 +198,10 @@ async fn telegram_inbound_loop(
         // Messages to pass on, in order: one each, or an album's parts.
         let mut ready: Vec<Vec<telegram::Message>> = Vec::new();
         for update in updates {
-            offset = update.update_id + 1;
+            if update.update_id < next {
+                continue;
+            }
+            next = update.update_id + 1;
             let Some(msg) = update.message else {
                 continue;
             };
@@ -211,7 +219,13 @@ async fn telegram_inbound_loop(
             }
             match msg.media_group_id.clone() {
                 Some(group) if private => {
-                    if let Some(album) = albums.add(group, msg, std::time::Instant::now()) {
+                    // A new album goes after the one before it.
+                    if !later_part {
+                        ready.extend(albums.take_chat(msg.chat.id));
+                    }
+                    if let Some(album) =
+                        albums.add(group, update.update_id, msg, std::time::Instant::now())
+                    {
                         ready.push(album);
                     }
                 }
@@ -259,12 +273,19 @@ struct Album {
     chat_id: i64,
     group: String,
     parts: Vec<telegram::Message>,
+    /// The update its first part came in.
+    first_update: i64,
     last: std::time::Instant,
 }
 
 impl Albums {
     fn is_empty(&self) -> bool {
         self.waiting.is_empty()
+    }
+
+    /// The update the first waiting part came in.
+    fn first_update(&self) -> Option<i64> {
+        self.waiting.iter().map(|a| a.first_update).min()
     }
 
     /// Whether parts of album `group` of `chat_id` wait already.
@@ -274,10 +295,12 @@ impl Albums {
             .any(|a| a.chat_id == chat_id && a.group == group)
     }
 
-    /// Hold `msg`, a part of album `group`; the album, when it is full.
+    /// Hold `msg`, a part of album `group` that came in update `update`;
+    /// the album, when it is full.
     fn add(
         &mut self,
         group: String,
+        update: i64,
         msg: telegram::Message,
         now: std::time::Instant,
     ) -> Option<Vec<telegram::Message>> {
@@ -293,6 +316,7 @@ impl Albums {
                 chat_id,
                 group,
                 parts: Vec::new(),
+                first_update: update,
                 last: now,
             });
             self.waiting.len() - 1
@@ -406,8 +430,13 @@ async fn translate(
         timestamp,
         // Stash the original payload for audit and so the agent can
         // inspect telegram-specific bits (username, first_name,
-        // forward_from, …) if a future skill teaches it to.
-        raw: serde_json::to_value(msg).ok(),
+        // forward_from, …) if a future skill teaches it to; every part of
+        // an album.
+        raw: if msgs.len() > 1 {
+            serde_json::to_value(msgs).ok()
+        } else {
+            serde_json::to_value(msg).ok()
+        },
         attachments,
     };
     Some(ChannelFrame::Inbound(inbound))
@@ -511,9 +540,10 @@ fn quoted(text: &str) -> String {
     serde_json::to_string(&cut).unwrap_or_default()
 }
 
-/// A replied-to message: its text or caption, quoted; else what it is.
+/// A replied-to message: its text quoted; else what it is, with its
+/// caption quoted.
 fn summary(msg: &telegram::Message) -> String {
-    if let Some(text) = msg.text.as_deref().or(msg.caption.as_deref()) {
+    if let Some(text) = msg.text.as_deref() {
         return quoted(text);
     }
     let value = serde_json::to_value(msg).unwrap_or_default();
@@ -522,7 +552,11 @@ fn summary(msg: &telegram::Message) -> String {
             .filter(|(_, v)| !v.is_null())
             .map(|(k, _)| k.as_str())
     });
-    content_kind(keys).unwrap_or("a message").to_string()
+    let kind = content_kind(keys).unwrap_or("a message");
+    match msg.caption.as_deref() {
+        Some(caption) => format!("{kind} with the caption {}", quoted(caption)),
+        None => kind.to_string(),
+    }
 }
 
 /// What a message with fields `keys` carries.
@@ -644,9 +678,24 @@ async fn media_content(
         } else {
             Some(sticker.file_id.as_str()).filter(|id| !id.is_empty())
         };
-        if let Some(file_id) = picture {
+        // A sticker sent again is not saved again: its picture is in the
+        // inbox, and saving counts against what a sender may send.
+        let key = (sender_id.to_string(), sticker.file_unique_id.clone());
+        let known = (!key.1.is_empty())
+            .then(|| STICKERS.lock().ok()?.get(&key).cloned())
+            .flatten();
+        if let Some(attachment) = known {
+            attachments.push(attachment);
+        } else if let Some(file_id) = picture {
             match receive_image(tg, gateway, sender_id, file_id, "sticker").await {
-                Ok(attachment) => attachments.push(attachment),
+                Ok(attachment) => {
+                    if !key.1.is_empty()
+                        && let Ok(mut stickers) = STICKERS.lock()
+                    {
+                        stickers.put(key, attachment.clone());
+                    }
+                    attachments.push(attachment);
+                }
                 Err(e) => {
                     warn!(error = %format!("{e:#}"), "could not pass a sticker's picture on");
                 }
@@ -691,11 +740,42 @@ fn media_file(
     msg.audio.as_ref().map(|a| (a, "audio.mp3", "audio/mpeg"))
 }
 
-/// A sticker, for the agent: its emoji and set.
+/// The pictures of stickers given to the gateway, by sender and sticker.
+static STICKERS: std::sync::LazyLock<Mutex<Stickers>> =
+    std::sync::LazyLock::new(|| Mutex::new(Stickers::default()));
+
+/// How many sticker pictures are remembered; past that, the oldest go.
+const STICKERS_KEPT: usize = 256;
+
+#[derive(Default)]
+struct Stickers {
+    saved: HashMap<(String, String), Attachment>,
+    order: std::collections::VecDeque<(String, String)>,
+}
+
+impl Stickers {
+    fn get(&self, key: &(String, String)) -> Option<&Attachment> {
+        self.saved.get(key)
+    }
+
+    fn put(&mut self, key: (String, String), attachment: Attachment) {
+        if self.saved.insert(key.clone(), attachment).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > STICKERS_KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.saved.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// A sticker, for the agent: its emoji and set, quoted.
 fn sticker_text(sticker: &telegram::Sticker) -> String {
-    let emoji = sticker.emoji.as_deref().unwrap_or("?");
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let emoji = q(sticker.emoji.as_deref().unwrap_or("?"));
     match &sticker.set_name {
-        Some(set) => format!("[sticker: {emoji}, from the set {set}]"),
+        Some(set) => format!("[sticker: {emoji}, from the set {}]", q(set)),
         None => format!("[sticker: {emoji}]"),
     }
 }
@@ -1343,7 +1423,10 @@ mod tests {
         let sticker: telegram::Sticker =
             serde_json::from_value(serde_json::json!({"emoji": "x", "set_name": "cats"}))
                 .expect("sticker");
-        assert_eq!(sticker_text(&sticker), "[sticker: x, from the set cats]");
+        assert_eq!(
+            sticker_text(&sticker),
+            "[sticker: \"x\", from the set \"cats\"]"
+        );
         let poll: telegram::Poll = serde_json::from_value(serde_json::json!({
             "question": "Lunch?", "options": [{"text": "noodles"}, {"text": "rice"}]
         }))
@@ -1482,11 +1565,28 @@ mod tests {
             m
         };
         let mut albums = Albums::default();
-        assert!(albums.add("g".into(), part(1, "g", 5), now).is_none());
+        assert!(
+            albums
+                .add("g".into(), 1 + 100, part(1, "g", 5), now)
+                .is_none()
+        );
         assert!(albums.holds(5, "g"));
         assert!(!albums.holds(6, "g"));
-        assert!(albums.add("g".into(), part(2, "g", 5), now).is_none());
-        assert!(albums.add("h".into(), part(3, "h", 6), now).is_none());
+        assert!(
+            albums
+                .add("g".into(), 2 + 100, part(2, "g", 5), now)
+                .is_none()
+        );
+        assert!(
+            albums
+                .add("h".into(), 3 + 100, part(3, "h", 6), now)
+                .is_none()
+        );
+        assert_eq!(
+            albums.first_update(),
+            Some(101),
+            "polls keep the first part"
+        );
         assert_eq!(albums.take_quiet(now + Duration::from_millis(500)).len(), 0);
         let other = albums.take_chat(6);
         assert_eq!(
@@ -1501,16 +1601,71 @@ mod tests {
             [1, 2]
         );
         assert!(albums.is_empty());
+        assert_eq!(albums.first_update(), None);
         for id in 0..9 {
             assert!(
                 albums
-                    .add("full".into(), part(id, "full", 5), now)
+                    .add("full".into(), id + 100, part(id, "full", 5), now)
                     .is_none()
             );
         }
-        let full = albums.add("full".into(), part(9, "full", 5), now);
+        let full = albums.add("full".into(), 9 + 100, part(9, "full", 5), now);
         assert_eq!(full.map(|parts| parts.len()), Some(ALBUM_PARTS));
         assert!(albums.is_empty());
+    }
+
+    #[test]
+    fn sticker_pictures_are_remembered_up_to_a_limit() {
+        let attachment = |n: usize| -> Attachment {
+            serde_json::from_value(serde_json::json!({
+                "name": format!("sticker{n}.webp"), "media_type": "image/webp",
+                "size": 1, "path": format!("inbox/sticker{n}.webp")
+            }))
+            .expect("attachment")
+        };
+        let key = |n: usize| ("tg:5".to_string(), format!("u{n}"));
+        let mut stickers = Stickers::default();
+        for n in 0..=STICKERS_KEPT {
+            stickers.put(key(n), attachment(n));
+        }
+        assert!(stickers.get(&key(0)).is_none(), "the oldest went");
+        assert_eq!(
+            stickers.get(&key(STICKERS_KEPT)).map(|a| a.path.as_str()),
+            Some(format!("inbox/sticker{STICKERS_KEPT}.webp").as_str())
+        );
+        assert!(
+            stickers
+                .get(&("tg:6".to_string(), format!("u{STICKERS_KEPT}")))
+                .is_none()
+        );
+        stickers.put(key(1), attachment(1));
+        assert_eq!(stickers.order.len(), STICKERS_KEPT, "a key once");
+    }
+
+    #[test]
+    fn a_replied_photo_names_its_kind_and_caption() {
+        let m = message(serde_json::json!({
+            "text": "this?",
+            "reply_to_message": {"message_id": 0, "date": 0, "chat": {"id": 5, "type": "private"},
+                                 "from": {"id": 5}, "caption": "the plan",
+                                 "photo": [{"file_id": "p", "width": 1, "height": 1}]}
+        }));
+        assert_eq!(
+            context_lines(&m),
+            [
+                "[Replying to their own earlier message (user-supplied, untrusted): a photo with the caption \"the plan\"]"
+            ]
+        );
+        let m = message(serde_json::json!({
+            "text": "and?",
+            "reply_to_message": {"message_id": 0, "date": 0, "chat": {"id": 5, "type": "private"},
+                                 "from": {"id": 9, "is_bot": true},
+                                 "animation": {"file_id": "a"}, "document": {"file_id": "a"}}
+        }));
+        assert_eq!(
+            context_lines(&m),
+            ["[Replying to the bot's message (user-supplied, untrusted): an animation]"]
+        );
     }
 
     fn counted() -> (Typing, Arc<AtomicU64>) {

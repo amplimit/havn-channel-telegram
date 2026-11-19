@@ -58,7 +58,7 @@ impl Telegram {
         } else {
             self.poll_timeout_seconds
         };
-        let resp: ApiResponse<Vec<Update>> = self
+        let resp: ApiResponse<Vec<serde_json::Value>> = self
             .http
             .get(&url)
             .query(&[
@@ -82,7 +82,14 @@ impl Telegram {
                 resp.description.unwrap_or_default()
             );
         }
-        Ok(resp.result.unwrap_or_default())
+        // Each on its own: one this bot cannot read is passed over, not
+        // left to hold up every message after it.
+        Ok(resp
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(read_update)
+            .collect())
     }
 
     /// Resolve a `file_id` to a downloadable path. Telegram returns
@@ -551,6 +558,22 @@ struct ResponseParameters {
 const SEND_TRIES: usize = 3;
 const MAX_RETRY_AFTER_SECONDS: u64 = 60;
 
+/// An update as this bot reads it; one whose message it cannot read keeps
+/// its id, so the poll moves past it, and no message.
+fn read_update(value: serde_json::Value) -> Option<Update> {
+    let update_id = value.get("update_id")?.as_i64()?;
+    match serde_json::from_value::<Update>(value) {
+        Ok(update) => Some(update),
+        Err(e) => {
+            tracing::warn!(update_id, error = %e, "passing over a Telegram update this bot cannot read");
+            Some(Update {
+                update_id,
+                message: None,
+            })
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Update {
     pub update_id: i64,
@@ -598,6 +621,9 @@ pub struct Message {
     pub audio: Option<MediaFile>,
     #[serde(default)]
     pub sticker: Option<Sticker>,
+    /// A GIF; it comes as a `document` too, which is what is passed on.
+    #[serde(default)]
+    pub animation: Option<serde_json::Value>,
     #[serde(default)]
     pub poll: Option<Poll>,
     /// Kinds of message a person sends on purpose that this bot cannot
@@ -659,6 +685,9 @@ pub struct MediaFile {
 pub struct Sticker {
     #[serde(default)]
     pub file_id: String,
+    /// The same for every copy of the sticker, unlike `file_id`.
+    #[serde(default)]
+    pub file_unique_id: String,
     #[serde(default)]
     pub emoji: Option<String>,
     #[serde(default)]
@@ -1081,6 +1110,20 @@ mod split_tests {
         assert!(!refused(
             &anyhow::anyhow!("operation timed out").context("sendPhoto request")
         ));
+    }
+
+    #[test]
+    fn an_update_that_cannot_be_read_is_passed_over() {
+        let good = serde_json::json!({"update_id": 7, "message": {
+            "message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"}, "text": "hi"}});
+        let bad = serde_json::json!({"update_id": 8, "message": {"message_id": "x"}});
+        let read = read_update(good).expect("good");
+        assert_eq!(read.update_id, 7);
+        assert!(read.message.is_some());
+        let read = read_update(bad).expect("bad");
+        assert_eq!(read.update_id, 8);
+        assert!(read.message.is_none());
+        assert!(read_update(serde_json::json!({"nothing": 1})).is_none());
     }
 
     #[test]
