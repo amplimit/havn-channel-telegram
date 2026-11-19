@@ -73,6 +73,17 @@ pub struct ChannelOutbound {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
     pub content: ChannelMessageContent,
+    /// Rows of buttons under the message (havn issue #203): pressed, the
+    /// button's `data` goes back as what the person sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<Vec<Button>>,
+}
+
+/// A button under a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Button {
+    pub label: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
