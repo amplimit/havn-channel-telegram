@@ -77,6 +77,19 @@ pub struct ChannelOutbound {
     /// button's `data` goes back as what the person sent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<Button>>,
+    /// A question of several answers to show as a poll, in place of the
+    /// text (havn issue #204): a vote goes back as `answer`, a space and
+    /// the chosen options' numbers (from 1), comma-separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Poll>,
+}
+
+/// A question of several answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Poll {
+    pub question: String,
+    pub options: Vec<String>,
+    pub answer: String,
 }
 
 /// A button under a message.
