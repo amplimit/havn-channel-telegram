@@ -63,6 +63,9 @@ pub struct Attachment {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_path: Option<String>,
+    /// An audio file's transcript, when the gateway made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
