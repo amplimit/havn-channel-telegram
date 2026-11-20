@@ -197,28 +197,9 @@ async fn telegram_inbound_loop(
     // over until then).
     let mut next: i64 = 0;
     let mut held = Held::default();
-    // One poll at a time. While messages are held it is raced against the
-    // first of them falling due; when that comes first they go on, and the
-    // same poll is waited on next, so none is given up or runs alongside
-    // another.
-    let mut poll: Option<Poll<'_>> = None;
+    let mut poll: Option<Poll> = None;
     loop {
-        let current = poll.get_or_insert_with(|| {
-            let offset = held.first_update().map_or(next, |first| first.min(next));
-            Box::pin(tg.get_updates(offset))
-        });
-        let polled = match held.due() {
-            Some(due) => {
-                tokio::select! {
-                    polled = current.as_mut() => Some(polled),
-                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => None,
-                }
-            }
-            None => Some(current.as_mut().await),
-        };
-        if polled.is_some() {
-            poll = None;
-        }
+        let polled = poll_or_due(&mut poll, &tg, &held, next).await;
         let updates = match polled {
             None => Vec::new(),
             Some(Ok(u)) => u,
@@ -291,14 +272,60 @@ async fn telegram_inbound_loop(
                 && outbound_tx.send(f).await.is_err()
             {
                 info!("outbound channel closed; telegram inbound loop exiting");
+                if let Some((task, _)) = &poll {
+                    task.abort();
+                }
                 return Ok(());
             }
         }
     }
 }
 
-/// A getUpdates call in flight.
-type Poll<'a> = Pin<Box<dyn Future<Output = Result<Vec<telegram::Update>>> + Send + 'a>>;
+/// A getUpdates call in flight, and when it was asked.
+type Poll = (
+    tokio::task::JoinHandle<Result<Vec<telegram::Update>>>,
+    std::time::Instant,
+);
+
+/// The updates of the poll in flight (asking one from `next`, or from the
+/// first held update, when none is), or none when the first of the held
+/// messages falls due first.
+///
+/// One poll at a time, in a task of its own so it ends in its time
+/// whatever the loop does. When the held messages come first, the same
+/// poll is waited on next, so none is given up or runs alongside another.
+/// A poll just asked is given [`POLL_GRACE`] first, so what came while the
+/// loop was busy (the rest of an album) joins.
+async fn poll_or_due(
+    poll: &mut Option<Poll>,
+    tg: &Telegram,
+    held: &Held,
+    next: i64,
+) -> Option<Result<Vec<telegram::Update>>> {
+    let (task, asked) = poll.get_or_insert_with(|| {
+        let offset = held.first_update().map_or(next, |first| first.min(next));
+        let tg = tg.clone();
+        (
+            tokio::spawn(async move { tg.get_updates(offset).await }),
+            std::time::Instant::now(),
+        )
+    });
+    let joined = match held.due() {
+        Some(due) => {
+            let until = due.max(*asked + POLL_GRACE);
+            tokio::select! {
+                joined = &mut *task => joined,
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => return None,
+            }
+        }
+        None => task.await,
+    };
+    *poll = None;
+    Some(joined.unwrap_or_else(|e| Err(e.into())))
+}
+
+/// How long a poll just asked may take to bring what came already.
+const POLL_GRACE: Duration = Duration::from_millis(500);
 
 /// How long an album waits for another part, and the most parts it has
 /// (Telegram's limit).
