@@ -149,7 +149,7 @@ Until it is connected, the bot treats you as someone else (see [Channel Adapters
 
 - the agent's shell, file and memory tools wait for your approval, which reaches only the dashboard's web chat;
 - nothing you say there changes the agent's memory;
-- the admin commands (`/model`, ...) need your id in `admins`, and even then the agent's tool calls are approved only from the web chat;
+- the admin commands (`/model`, ...) need your id in `admins`, and even then the calls that wait for the owner (shell, files, memory, MCP) are approved only from the web chat;
 - these chats are not listed in the web chat nor searched with your others.
 
 ## Check that it works
