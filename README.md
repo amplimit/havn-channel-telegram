@@ -31,7 +31,7 @@ Who may use the bot, what the commands do and how chats work is decided by the g
 
 - A Havn gateway, 0.2.2 or later for the command menu and 0.2.7 or later for replies missed while disconnected (`havn --version`).
 - A Telegram bot: create one with [@BotFather](https://t.me/BotFather) (`/newbot`) and keep its token (`1234567890:AAH...`).
-- Rust, to build the daemon.
+- Linux on x86_64 or aarch64 for the release binaries; elsewhere, Rust 1.94 or later to build the daemon.
 
 ## Setup
 
@@ -69,12 +69,28 @@ havn credential add channel:telegram "$ADAPTER_TOKEN" --name acme-bot
 
 The `--name` is the account id, so the gateway finds it as `secret:channel:telegram:acme-bot`. Keep the token for the daemon's config.
 
-### 3. Build and install the daemon
+### 3. Install the daemon
+
+Download the release for the machine, check it and install the binary:
+
+```bash
+VERSION=0.2.8   # the release with the gateway's version (`havn --version`); the first is 0.2.8
+asset="havn-channel-telegram-$(uname -m)-unknown-linux-musl.tar.gz"
+base="https://github.com/amplimit/havn-channel-telegram/releases/download/v$VERSION"
+curl -fL -O "$base/$asset" -O "$base/$asset.sha256"
+sha256sum -c "$asset.sha256"
+tar -xzf "$asset"
+sudo install -m 755 havn-channel-telegram /usr/local/bin/
+```
+
+The binary is static, so it runs on any Linux of its architecture whatever the glibc. The archive also holds `config.example.toml`, for the next step. To upgrade, install the new release the same way and `sudo systemctl restart havn-channel-telegram`.
+
+Or build it from source:
 
 ```bash
 git clone https://github.com/amplimit/havn-channel-telegram
 cd havn-channel-telegram
-cargo build --release
+cargo build --release --locked
 sudo install -m 755 target/release/havn-channel-telegram /usr/local/bin/
 ```
 
