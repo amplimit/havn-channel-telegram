@@ -147,6 +147,10 @@ impl Telegram {
             .error_for_status()
             .map_err(reqwest::Error::without_url)
             .context("download_file status")?;
+        // Redirects are not followed, so a 3xx is no file.
+        if !resp.status().is_success() {
+            anyhow::bail!("download_file: the server answered {}", resp.status());
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = resp.chunk().await.context("download_file body")? {
             bytes.extend_from_slice(&chunk);
