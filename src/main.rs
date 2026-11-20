@@ -197,21 +197,28 @@ async fn telegram_inbound_loop(
     // over until then).
     let mut next: i64 = 0;
     let mut held = Held::default();
+    // One poll at a time. While messages are held it is raced against the
+    // first of them falling due; when that comes first they go on, and the
+    // same poll is waited on next, so none is given up or runs alongside
+    // another.
+    let mut poll: Option<Poll<'_>> = None;
     loop {
-        let offset = held.first_update().map_or(next, |first| first.min(next));
-        // While messages are held, the poll is given up when the first of
-        // them is due, so they go on then; what it would have brought comes
-        // again with the next, as the offset is the same.
-        let poll = tg.get_updates(offset);
+        let current = poll.get_or_insert_with(|| {
+            let offset = held.first_update().map_or(next, |first| first.min(next));
+            Box::pin(tg.get_updates(offset))
+        });
         let polled = match held.due() {
             Some(due) => {
                 tokio::select! {
-                    polled = poll => Some(polled),
+                    polled = current.as_mut() => Some(polled),
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => None,
                 }
             }
-            None => Some(poll.await),
+            None => Some(current.as_mut().await),
         };
+        if polled.is_some() {
+            poll = None;
+        }
         let updates = match polled {
             None => Vec::new(),
             Some(Ok(u)) => u,
@@ -290,6 +297,9 @@ async fn telegram_inbound_loop(
     }
 }
 
+/// A getUpdates call in flight.
+type Poll<'a> = Pin<Box<dyn Future<Output = Result<Vec<telegram::Update>>> + Send + 'a>>;
+
 /// How long an album waits for another part, and the most parts it has
 /// (Telegram's limit).
 const ALBUM_QUIET: Duration = Duration::from_millis(1500);
@@ -357,13 +367,15 @@ impl Held {
             self.pass(msg, ready);
             return false;
         }
-        // A text that replies, quotes or is forwarded starts its own, and
-        // so does anything after a hold that is due already.
-        let joins = (group.is_some() || context_lines(&msg).is_empty())
-            && self
-                .waiting
-                .iter()
-                .any(|h| h.chat_id == chat_id && h.group == group && now < h.due);
+        // A part joins its album however late it is read. A text that
+        // replies, quotes or is forwarded starts its own, and so does one
+        // after texts that are due already.
+        let text_joins = context_lines(&msg).is_empty();
+        let joins = self.waiting.iter().any(|h| {
+            h.chat_id == chat_id
+                && h.group == group
+                && (group.is_some() || text_joins && now < h.due)
+        });
         if !joins {
             ready.extend(self.take_chat(chat_id));
         }
@@ -1736,6 +1748,13 @@ mod tests {
         }
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].len(), ALBUM_PARTS);
+        ready.clear();
+
+        // A part read late, after a slow upload, still joins its album.
+        held.put(20, part(20, "late", 5), now, &mut ready);
+        let late = now + ALBUM_QUIET * 4;
+        assert!(held.put(21, part(21, "late", 5), late, &mut ready));
+        assert_eq!(ids(&held.take_due(late + ALBUM_QUIET)[0]), [20, 21]);
         assert!(held.waiting.is_empty());
     }
 
