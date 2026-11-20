@@ -710,24 +710,11 @@ async fn media_content(
         } else {
             Some(sticker.file_id.as_str()).filter(|id| !id.is_empty())
         };
-        // A sticker sent again is not saved again: its picture is in the
-        // inbox, and saving counts against what a sender may send.
-        let key = (sender_id.to_string(), sticker.file_unique_id.clone());
-        let known = (!key.1.is_empty())
-            .then(|| STICKERS.lock().ok()?.get(&key).cloned())
-            .flatten();
-        if let Some(attachment) = known {
-            attachments.push(attachment);
-        } else if let Some(file_id) = picture {
+        // Given each time it comes: the gateway takes a file for one
+        // message only (issue #28).
+        if let Some(file_id) = picture {
             match receive_image(tg, gateway, sender_id, file_id, "sticker").await {
-                Ok(attachment) => {
-                    if !key.1.is_empty()
-                        && let Ok(mut stickers) = STICKERS.lock()
-                    {
-                        stickers.put(key, attachment.clone());
-                    }
-                    attachments.push(attachment);
-                }
+                Ok(attachment) => attachments.push(attachment),
                 Err(e) => {
                     warn!(error = %format!("{e:#}"), "could not pass a sticker's picture on");
                 }
@@ -770,36 +757,6 @@ fn media_file(
         return Some((v, "video-note.mp4", "video/mp4"));
     }
     msg.audio.as_ref().map(|a| (a, "audio.mp3", "audio/mpeg"))
-}
-
-/// The pictures of stickers given to the gateway, by sender and sticker.
-static STICKERS: std::sync::LazyLock<Mutex<Stickers>> =
-    std::sync::LazyLock::new(|| Mutex::new(Stickers::default()));
-
-/// How many sticker pictures are remembered; past that, the oldest go.
-const STICKERS_KEPT: usize = 256;
-
-#[derive(Default)]
-struct Stickers {
-    saved: HashMap<(String, String), Attachment>,
-    order: std::collections::VecDeque<(String, String)>,
-}
-
-impl Stickers {
-    fn get(&self, key: &(String, String)) -> Option<&Attachment> {
-        self.saved.get(key)
-    }
-
-    fn put(&mut self, key: (String, String), attachment: Attachment) {
-        if self.saved.insert(key.clone(), attachment).is_none() {
-            self.order.push_back(key);
-        }
-        while self.order.len() > STICKERS_KEPT {
-            if let Some(oldest) = self.order.pop_front() {
-                self.saved.remove(&oldest);
-            }
-        }
-    }
 }
 
 /// A sticker, for the agent: its emoji and set, quoted.
@@ -1756,34 +1713,6 @@ mod tests {
             ))
         );
         assert!(polls.take(&format!("p{POLLS_KEPT}")).is_none(), "once");
-    }
-
-    #[test]
-    fn sticker_pictures_are_remembered_up_to_a_limit() {
-        let attachment = |n: usize| -> Attachment {
-            serde_json::from_value(serde_json::json!({
-                "name": format!("sticker{n}.webp"), "media_type": "image/webp",
-                "size": 1, "path": format!("inbox/sticker{n}.webp")
-            }))
-            .expect("attachment")
-        };
-        let key = |n: usize| ("tg:5".to_string(), format!("u{n}"));
-        let mut stickers = Stickers::default();
-        for n in 0..=STICKERS_KEPT {
-            stickers.put(key(n), attachment(n));
-        }
-        assert!(stickers.get(&key(0)).is_none(), "the oldest went");
-        assert_eq!(
-            stickers.get(&key(STICKERS_KEPT)).map(|a| a.path.as_str()),
-            Some(format!("inbox/sticker{STICKERS_KEPT}.webp").as_str())
-        );
-        assert!(
-            stickers
-                .get(&("tg:6".to_string(), format!("u{STICKERS_KEPT}")))
-                .is_none()
-        );
-        stickers.put(key(1), attachment(1));
-        assert_eq!(stickers.order.len(), STICKERS_KEPT, "a key once");
     }
 
     #[test]
