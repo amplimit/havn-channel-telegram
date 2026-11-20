@@ -1,0 +1,137 @@
+name: release
+
+# Builds static (musl) binaries and publishes them to a GitHub Release, so
+# the adapter installs without a Rust toolchain and runs whatever the
+# host's glibc.
+#
+# Trigger: push a tag like `v0.2.8`. `workflow_dispatch` runs the build for
+# testing (and, given a `tag` input, uploads to that release).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload to (leave blank to only build artifacts)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    # The adapter's version follows Havn's: vX.Y.Z of both go together.
+    # Before tagging, set `[package] version` to X.Y.Z and refresh
+    # Cargo.lock (`cargo update -w`).
+    name: tag matches crate version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare tag and Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        env:
+          TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+        run: |
+          # A manual run builds the ref it was started from, so for a tag
+          # it must be started from that tag.
+          if [ "$GITHUB_REF" != "refs/tags/$TAG" ]; then
+            echo "::error::run it from the tag: gh workflow run release.yml --ref $TAG -f tag=$TAG"
+            exit 1
+          fi
+          version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          echo "crate version: ${version:-<none>}"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match crate version ${version:-<none>}; set it to ${TAG#v} in Cargo.toml before tagging"
+            exit 1
+          fi
+      - name: Cargo.lock matches the version bump
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        run: |
+          rustup toolchain install
+          cargo metadata --locked --format-version 1 >/dev/null
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [version, ci]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install pinned toolchain + musl target
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: install zig + cargo-zigbuild
+        # zig is the cross C compiler and linker for the bundled C code
+        # (aws-lc, ring) on both targets, aarch64 included from this runner.
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | sudo tar -xJ -C /opt
+          echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild
+
+      - name: build the static binary
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+
+      - name: verify the binary is fully static
+        run: |
+          bin="target/${{ matrix.target }}/release/havn-channel-telegram"
+          file "$bin"
+          file "$bin" | grep -q "statically linked" \
+            || { echo "::error::$bin is not statically linked"; exit 1; }
+          if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+            "$bin" --version
+          fi
+
+      - name: package
+        id: pkg
+        run: |
+          triple="${{ matrix.target }}"
+          asset="havn-channel-telegram-${triple}.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/${asset}" \
+            -C "target/${triple}/release" havn-channel-telegram \
+            -C "${GITHUB_WORKSPACE}" config.example.toml LICENSE
+          ( cd dist && sha256sum "${asset}" > "${asset}.sha256" )
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+          ls -lh dist
+
+      - name: upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: publish to release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+        run: |
+          # The matrix jobs race to create the release; the loser uploads to
+          # the one that exists. --clobber lets a rerun replace assets.
+          gh release create "$TAG" --title "$TAG" --generate-notes \
+            || echo "release $TAG already exists; uploading assets"
+          gh release upload "$TAG" dist/* --clobber

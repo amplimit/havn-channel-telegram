@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the channel and components; with no
+      # arguments `rustup toolchain install` installs exactly that.
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 >/dev/null
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  musl:
+    # The release binaries are static musl builds; this keeps a tag from
+    # finding out first that one of them does not build.
+    name: musl build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-${{ matrix.target }}
+      - name: install zig + cargo-zigbuild
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | sudo tar -xJ -C /opt
+          echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild
+      - run: cargo zigbuild --locked --target ${{ matrix.target }}
