@@ -45,6 +45,12 @@ pub struct Config {
     #[serde(default = "default_poll_timeout")]
     pub poll_timeout_seconds: u64,
 
+    /// The Bot API's address: Telegram's, or a self-hosted
+    /// `telegram-bot-api` server's. `https://`, or `http://` to a
+    /// loopback address only, as every URL carries the bot token.
+    #[serde(default = "default_bot_api")]
+    pub bot_api: String,
+
     /// No longer used: voice messages go to the gateway, which
     /// transcribes them (havn issue #164). Read only to warn about them.
     #[serde(default)]
@@ -61,6 +67,10 @@ fn default_channel_id() -> String {
 
 fn default_poll_timeout() -> u64 {
     25
+}
+
+fn default_bot_api() -> String {
+    "https://api.telegram.org".into()
 }
 
 impl Config {
@@ -88,6 +98,20 @@ impl Config {
         }
         if self.account_id.is_empty() {
             anyhow::bail!("account_id must not be empty");
+        }
+        let api = url::Url::parse(&self.bot_api)
+            .with_context(|| format!("bot_api {:?} is not a URL", self.bot_api))?;
+        let loopback = match api.host() {
+            Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        if !(api.scheme() == "https" || api.scheme() == "http" && loopback) {
+            anyhow::bail!(
+                "bot_api must be https://, or http:// to a loopback address; got {:?}",
+                self.bot_api
+            );
         }
         // Defence in depth: havn's channel_id_codec rejects the `|`
         // separator in any field that round-trips through channel_id.
@@ -140,6 +164,38 @@ mod tests {
         assert_eq!(c.account_id, "alice-tg-bot");
         assert_eq!(c.channel_id, "telegram"); // default
         assert_eq!(c.poll_timeout_seconds, 25);
+        assert_eq!(c.bot_api, "https://api.telegram.org");
+    }
+
+    #[test]
+    fn bot_api_is_https_or_loopback() {
+        let load = |api: &str| {
+            Config::load(&write_temp(&format!(
+                r#"
+                bot_token = "x"
+                havn_gateway = "ws://h"
+                adapter_token = "x"
+                account_id = "alice"
+                bot_api = "{api}"
+                "#
+            )))
+        };
+        for api in [
+            "https://tg.example.com",
+            "http://127.0.0.1:8081",
+            "http://localhost:8081/",
+            "http://[::1]:8081",
+        ] {
+            assert!(load(api).is_ok(), "{api}");
+        }
+        for api in [
+            "http://tg.example.com",
+            "http://10.0.0.1:8081",
+            "ftp://x",
+            "api.telegram.org",
+        ] {
+            assert!(load(api).is_err(), "{api}");
+        }
     }
 
     #[test]

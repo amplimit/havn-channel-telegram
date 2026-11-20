@@ -5,8 +5,8 @@
 //! `sendChatAction` (typing indicator).
 //!
 //! Reference: <https://core.telegram.org/bots/api>. Bot tokens look
-//! like `<bot_id>:<random>`; the API base is
-//! `https://api.telegram.org/bot<token>/`.
+//! like `<bot_id>:<random>`; the API base is `<bot_api>/bot<token>/`,
+//! `bot_api` being `https://api.telegram.org` unless configured.
 //!
 //! We deliberately don't pull in `teloxide` or another full SDK —
 //! this daemon's surface is tiny, and a small bespoke client is
@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone)]
 pub struct Telegram {
     base: String,
+    /// Where files are downloaded from; also holds the bot token.
+    files: String,
     http: reqwest::Client,
     poll_timeout_seconds: u64,
 }
@@ -32,7 +34,7 @@ impl std::fmt::Debug for Telegram {
 }
 
 impl Telegram {
-    pub fn new(bot_token: &str, poll_timeout_seconds: u64) -> Result<Self> {
+    pub fn new(bot_api: &str, bot_token: &str, poll_timeout_seconds: u64) -> Result<Self> {
         let http = reqwest::Client::builder()
             // getUpdates long-poll timeout + 5s slack so the HTTP
             // client doesn't fire before Telegram does.
@@ -40,7 +42,8 @@ impl Telegram {
             .build()
             .context("build reqwest client")?;
         Ok(Self {
-            base: format!("https://api.telegram.org/bot{bot_token}"),
+            base: format!("{}/bot{bot_token}", bot_api.trim_end_matches('/')),
+            files: format!("{}/file/bot{bot_token}", bot_api.trim_end_matches('/')),
             http,
             poll_timeout_seconds,
         })
@@ -121,15 +124,10 @@ impl Telegram {
         Ok(file.file_path)
     }
 
-    /// Download the raw bytes of a Telegram-hosted file. URL format
-    /// is `https://api.telegram.org/file/bot<token>/<file_path>`.
+    /// Download the raw bytes of a Telegram-hosted file, from
+    /// `<bot_api>/file/bot<token>/<file_path>`.
     pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        let url = format!(
-            "https://api.telegram.org/file/{}/{file_path}",
-            // self.base is `https://api.telegram.org/bot<token>`; the
-            // file URL replaces `bot<token>` with `file/bot<token>`.
-            self.base.trim_start_matches("https://api.telegram.org/")
-        );
+        let url = format!("{}/{file_path}", self.files);
         let mut resp = self
             .http
             .get(&url)

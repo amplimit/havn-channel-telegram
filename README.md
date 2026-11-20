@@ -114,6 +114,10 @@ account_id    = "acme-bot"                  # the account's id
 
 # Seconds Telegram holds a long poll open (at most 50; default 25).
 poll_timeout_seconds = 25
+
+# The Bot API's address: Telegram's (the default), or another server that speaks it,
+# such as telegram-bot-api run without --local. https://, or http:// to this machine only.
+# bot_api = "https://api.telegram.org"
 ```
 
 ### 5. Run it under systemd

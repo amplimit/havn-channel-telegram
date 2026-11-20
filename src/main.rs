@@ -88,8 +88,8 @@ async fn main() -> Result<()> {
         "havn-channel-telegram starting"
     );
 
-    let telegram =
-        Telegram::new(&cfg.bot_token, cfg.poll_timeout_seconds).context("Telegram client init")?;
+    let telegram = Telegram::new(&cfg.bot_api, &cfg.bot_token, cfg.poll_timeout_seconds)
+        .context("Telegram client init")?;
     // Voice messages go to the gateway, which transcribes them (havn
     // issue #164).
     if cfg.openai_api_key.is_some() || cfg.whisper_base_url.is_some() || cfg.whisper_model.is_some()
