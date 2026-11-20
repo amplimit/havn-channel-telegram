@@ -60,15 +60,10 @@ impl Telegram {
     /// Long-poll for updates from Telegram. `offset` is the
     /// `update_id + 1` of the last update we processed; Telegram
     /// drops anything older than that on its end. Returns up to 100
-    /// updates per call (Telegram's hard cap). `briefly` holds the poll
-    /// open for a second only, while an album waits for its parts.
-    pub async fn get_updates(&self, offset: i64, briefly: bool) -> Result<Vec<Update>> {
+    /// updates per call (Telegram's hard cap).
+    pub async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
         let url = format!("{}/getUpdates", self.base);
-        let timeout = if briefly {
-            1
-        } else {
-            self.poll_timeout_seconds
-        };
+        let timeout = self.poll_timeout_seconds;
         let resp: ApiResponse<Vec<serde_json::Value>> = self
             .http
             .get(&url)
