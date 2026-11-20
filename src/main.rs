@@ -12,10 +12,13 @@
 //!   deliver to the right user.
 //!
 //! Group/supergroup/channel messages are dropped with a debug log —
-//! v0.2 supports 1:1 DMs only. Non-text content is also dropped on
-//! the outbound side; agents that emit `Image` / `File` won't see a
-//! delivery error today (the WS `deliver` succeeds gateway-side, the
-//! daemon just doesn't translate). Add when a real user asks.
+//! v0.2 supports 1:1 DMs only. On the outbound side every content kind
+//! reaches the user: text through `sendMessage` (with the gateway's
+//! buttons), a poll through `sendPoll` (its text if Telegram refuses
+//! it), and a `File` fetched from the gateway and sent as a photo,
+//! animation or document by what its bytes are; a file that cannot be
+//! fetched or sent becomes a line saying so. `Image`, `Audio`,
+//! `Location` and `Contact` go as text markers (`[image: <url>]`, ...).
 
 #![forbid(unsafe_code)]
 
@@ -1222,10 +1225,12 @@ impl Typing {
     }
 }
 
-/// havn → Telegram. Drain WS-received frames and translate each
-/// `ChannelFrame::Outbound` into a `sendMessage` call. Other frame
-/// kinds (Pong from gateway-initiated keepalive, ignored Inbound /
-/// Resume) are logged and dropped.
+/// havn → Telegram. Drain WS-received frames: each
+/// `ChannelFrame::Outbound` is delivered by [`deliver_outbound`], and
+/// `Commands` sets the bot's command menu. `Pong` is ignored; `Inbound`
+/// and `Resume`, which only the adapter sends (the gateway replays from
+/// a `Resume` it receives, as from `since` on the upgrade), and `Ping`
+/// are logged and dropped.
 async fn havn_outbound_loop(
     tg: Telegram,
     gateway: Gateway,
