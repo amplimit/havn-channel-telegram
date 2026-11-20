@@ -39,8 +39,16 @@ impl Telegram {
             // getUpdates long-poll timeout + 5s slack so the HTTP
             // client doesn't fire before Telegram does.
             .timeout(std::time::Duration::from_secs(poll_timeout_seconds + 5))
-            .build()
-            .context("build reqwest client")?;
+            // The bot token is in every URL: it is not carried to where a
+            // redirect points, nor, in the clear, to a proxy.
+            .redirect(reqwest::redirect::Policy::none());
+        let http = if bot_api.starts_with("http://") {
+            http.no_proxy()
+        } else {
+            http
+        }
+        .build()
+        .context("build reqwest client")?;
         Ok(Self {
             base: format!("{}/bot{bot_token}", bot_api.trim_end_matches('/')),
             files: format!("{}/file/bot{bot_token}", bot_api.trim_end_matches('/')),

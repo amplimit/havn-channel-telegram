@@ -77,13 +77,13 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Self =
+        let mut cfg: Self =
             toml::from_str(&raw).with_context(|| format!("parsing {} as TOML", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&mut self) -> Result<()> {
         if self.bot_token.is_empty() {
             anyhow::bail!("bot_token must not be empty");
         }
@@ -99,8 +99,16 @@ impl Config {
         if self.account_id.is_empty() {
             anyhow::bail!("account_id must not be empty");
         }
-        let api = url::Url::parse(&self.bot_api)
-            .with_context(|| format!("bot_api {:?} is not a URL", self.bot_api))?;
+        // Every request's URL carries the bot token; the value is not shown
+        // in errors, as it may hold a password.
+        let api = url::Url::parse(&self.bot_api).context("bot_api is not a URL")?;
+        if !api.username().is_empty()
+            || api.password().is_some()
+            || api.query().is_some()
+            || api.fragment().is_some()
+        {
+            anyhow::bail!("bot_api must hold no user, password, query or fragment");
+        }
         let loopback = match api.host() {
             Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
             Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -108,11 +116,10 @@ impl Config {
             None => false,
         };
         if !(api.scheme() == "https" || api.scheme() == "http" && loopback) {
-            anyhow::bail!(
-                "bot_api must be https://, or http:// to a loopback address; got {:?}",
-                self.bot_api
-            );
+            anyhow::bail!("bot_api must be https://, or http:// to a loopback address");
         }
+        // As parsed, so what was checked is what is asked.
+        self.bot_api = api.as_str().trim_end_matches('/').to_string();
         // Defence in depth: havn's channel_id_codec rejects the `|`
         // separator in any field that round-trips through channel_id.
         // Reject pre-emptively so a misconfigured daemon fails fast
@@ -193,9 +200,19 @@ mod tests {
             "http://10.0.0.1:8081",
             "ftp://x",
             "api.telegram.org",
+            "http://localhost:8081?x=1",
+            "http://localhost:8081#f",
+            "https://user:pass@tg.example.com",
+            "http://localhost@evil.example.com",
         ] {
             assert!(load(api).is_err(), "{api}");
         }
+        let api = |raw: &str| load(raw).expect("config").bot_api;
+        assert_eq!(api("http://localhost:8081/ "), "http://localhost:8081");
+        assert_eq!(
+            api("HTTPS://TG.example.com/api/"),
+            "https://tg.example.com/api"
+        );
     }
 
     #[test]
