@@ -294,8 +294,9 @@ type Poll = (
 /// One poll at a time, in a task of its own so it ends in its time
 /// whatever the loop does. When the held messages come first, the same
 /// poll is waited on next, so none is given up or runs alongside another.
-/// A poll just asked is given [`POLL_GRACE`] first, so what came while the
-/// loop was busy (the rest of an album) joins.
+/// A poll asked when a hold was due already is given [`POLL_GRACE`]
+/// first, so what came while the loop was busy (the rest of an album)
+/// joins.
 async fn poll_or_due(
     poll: &mut Option<Poll>,
     tg: &Telegram,
@@ -312,7 +313,7 @@ async fn poll_or_due(
     });
     let joined = match held.due() {
         Some(due) => {
-            let until = due.max(*asked + POLL_GRACE);
+            let until = deadline(due, *asked);
             tokio::select! {
                 joined = &mut *task => joined,
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => return None,
@@ -324,8 +325,17 @@ async fn poll_or_due(
     Some(joined.unwrap_or_else(|e| Err(e.into())))
 }
 
-/// How long a poll just asked may take to bring what came already.
+/// How long a poll asked late may take to bring what came already.
 const POLL_GRACE: Duration = Duration::from_millis(500);
+
+/// When the poll asked at `asked` is given up for the holds due at `due`.
+fn deadline(due: std::time::Instant, asked: std::time::Instant) -> std::time::Instant {
+    if asked >= due {
+        asked + POLL_GRACE
+    } else {
+        due
+    }
+}
 
 /// How long an album waits for another part, and the most parts it has
 /// (Telegram's limit).
@@ -1838,6 +1848,15 @@ mod tests {
         held.put(6, text(6, "one"), now, &mut ready);
         assert!(!held.put(7, text(7, "two"), now + TEXT_QUIET, &mut ready));
         assert_eq!(ready.iter().map(|m| ids(m)).collect::<Vec<_>>(), [vec![6]]);
+    }
+
+    #[test]
+    fn a_poll_asked_late_gets_a_moment() {
+        let now = std::time::Instant::now();
+        let due = now + TEXT_QUIET;
+        assert_eq!(deadline(due, now), due, "on time: the hold's own window");
+        let late = due + Duration::from_secs(4);
+        assert_eq!(deadline(due, late), late + POLL_GRACE);
     }
 
     #[test]
