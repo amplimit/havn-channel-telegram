@@ -350,13 +350,10 @@ impl Held {
         }
         let chat_id = msg.chat.id;
         let group = msg.media_group_id.clone();
-        // What follows a part of a long paste is its next part, even when
-        // the app's split puts a `/` first.
-        let pasted = self
-            .waiting
-            .iter()
-            .any(|h| h.chat_id == chat_id && h.group.is_none() && h.parts.last().is_some_and(long));
-        if group.is_none() && (msg.text.is_none() || command(&msg) && !pasted) {
+        // A command goes on at once, even right after a part of a long
+        // paste (`/stop`); a part the app's split starts with a path is
+        // not one.
+        if group.is_none() && (msg.text.is_none() || command(&msg)) {
             self.pass(msg, ready);
             return false;
         }
@@ -1781,6 +1778,15 @@ mod tests {
         let done = held.take_due(later + TEXT_QUIET);
         assert_eq!(ids(&done[0]), [3, 4, 5]);
         assert!(ready.is_empty());
+
+        // A command right after a long part is not a part.
+        held.put(8, text(8, &part), now, &mut ready);
+        assert!(!held.put(9, text(9, "/stop"), now, &mut ready));
+        assert_eq!(
+            ready.iter().map(|m| ids(m)).collect::<Vec<_>>(),
+            [vec![8], vec![9]]
+        );
+        ready.clear();
 
         // A hold that is due takes no more, even before it has gone on.
         held.put(6, text(6, "one"), now, &mut ready);
