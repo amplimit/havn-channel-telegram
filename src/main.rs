@@ -192,16 +192,20 @@ async fn telegram_inbound_loop(
 ) -> Result<()> {
     let seq = Arc::new(AtomicU64::new(1));
     // The next update not seen yet. Telegram forgets the updates before
-    // the offset a poll gives, so while album parts wait, polls give the
+    // the offset a poll gives, so while messages are held, polls give the
     // first of them: a restart then gets them again (seen ones are passed
     // over until then).
     let mut next: i64 = 0;
-    let mut albums = Albums::default();
+    let mut held = Held::default();
     loop {
-        let offset = albums.first_update().map_or(next, |first| first.min(next));
-        // While an album waits for its parts, polls are brief, so it goes
-        // on soon after its last part.
-        let updates = match tg.get_updates(offset, !albums.is_empty()).await {
+        let offset = held.first_update().map_or(next, |first| first.min(next));
+        // While messages are held, the next poll waits until the first of
+        // them is due and asks for what came meanwhile, so they go on then
+        // unless more came.
+        if let Some(due) = held.due() {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+        }
+        let updates = match tg.get_updates(offset, !held.is_empty()).await {
             Ok(u) => u,
             Err(e) => {
                 warn!(error = %e, "telegram getUpdates failed; backing off 5s");
@@ -209,7 +213,7 @@ async fn telegram_inbound_loop(
                 Vec::new()
             }
         };
-        // Messages to pass on, in order: one each, or an album's parts.
+        // Messages to pass on, in order: one each, or what was gathered.
         let mut ready: Vec<Vec<telegram::Message>> = Vec::new();
         for update in updates {
             if update.update_id < next {
@@ -223,9 +227,8 @@ async fn telegram_inbound_loop(
                 let Some(msg) = vote_message(&tg, &vote) else {
                     continue;
                 };
-                ready.extend(albums.take_chat(msg.chat.id));
                 typing.start(msg.chat.id);
-                ready.push(vec![msg]);
+                held.pass(msg, &mut ready);
                 continue;
             }
             let msg = match (update.message, update.callback_query) {
@@ -243,44 +246,25 @@ async fn telegram_inbound_loop(
                     let Some(msg) = pressed else {
                         continue;
                     };
-                    msg
+                    // A press goes on at once, not gathered with texts.
+                    if msg.chat.kind == "private" {
+                        typing.start(msg.chat.id);
+                    }
+                    held.pass(msg, &mut ready);
+                    continue;
                 }
                 (None, None) => continue,
             };
-            let private = msg.chat.kind == "private";
             // Typing shows from before translate (which may do STT) until
             // the reply comes (issue #12); only for private chats, as
-            // group messages are dropped by translate. An album is one
-            // message, with one reply.
-            let later_part = msg
-                .media_group_id
-                .as_deref()
-                .is_some_and(|group| albums.holds(msg.chat.id, group));
-            if private && !later_part {
-                typing.start(msg.chat.id);
-            }
-            match msg.media_group_id.clone() {
-                Some(group) if private => {
-                    // A new album goes after the one before it.
-                    if !later_part {
-                        ready.extend(albums.take_chat(msg.chat.id));
-                    }
-                    if let Some(album) =
-                        albums.add(group, update.update_id, msg, std::time::Instant::now())
-                    {
-                        ready.push(album);
-                    }
-                }
-                _ => {
-                    // An album before this message goes first.
-                    if private {
-                        ready.extend(albums.take_chat(msg.chat.id));
-                    }
-                    ready.push(vec![msg]);
-                }
+            // group messages are dropped by translate. What is gathered is
+            // one message, with one reply.
+            let (chat_id, private) = (msg.chat.id, msg.chat.kind == "private");
+            if !held.put(update.update_id, msg, std::time::Instant::now(), &mut ready) && private {
+                typing.start(chat_id);
             }
         }
-        ready.extend(albums.take_quiet(std::time::Instant::now()));
+        ready.extend(held.take_due(std::time::Instant::now()));
         for msgs in ready {
             let chat_id = msgs[0].chat.id;
             let frame = translate(&msgs, &tg, &gateway, &account_id, &seq).await;
@@ -302,93 +286,157 @@ async fn telegram_inbound_loop(
 /// (Telegram's limit).
 const ALBUM_QUIET: Duration = Duration::from_millis(1500);
 const ALBUM_PARTS: usize = 10;
+/// How long a text waits for another (issue #24): briefly, for messages
+/// sent in quick succession; as long as an album part after a text near
+/// [`TEXT_SPLIT`] long, where the Telegram app splits a long paste (4096).
+/// At most [`TEXT_PARTS`] go together.
+const TEXT_QUIET: Duration = Duration::from_millis(300);
+const TEXT_SPLIT: usize = 3500;
+const TEXT_PARTS: usize = 25;
 
-/// Album parts waiting for the rest of their album (issue #14): Telegram
-/// sends each part as its own message, one right after another, with the
-/// album's `media_group_id`.
+/// Messages held to go on as one: the parts of an album (issue #14), which
+/// Telegram sends one right after another with the album's
+/// `media_group_id`, or texts sent in quick succession, a long paste among
+/// them (issue #24). A chat has one hold at a time; a message that does
+/// not join it sends it on first, so the order stays.
 #[derive(Default)]
-struct Albums {
-    waiting: Vec<Album>,
+struct Held {
+    waiting: Vec<Hold>,
 }
 
-struct Album {
+struct Hold {
     chat_id: i64,
-    group: String,
+    /// The album's `media_group_id`; none for texts.
+    group: Option<String>,
     parts: Vec<telegram::Message>,
     /// The update its first part came in.
     first_update: i64,
-    last: std::time::Instant,
+    /// When it goes on unless another part comes.
+    due: std::time::Instant,
 }
 
-impl Albums {
+impl Held {
     fn is_empty(&self) -> bool {
         self.waiting.is_empty()
     }
 
     /// The update the first waiting part came in.
     fn first_update(&self) -> Option<i64> {
-        self.waiting.iter().map(|a| a.first_update).min()
+        self.waiting.iter().map(|h| h.first_update).min()
     }
 
-    /// Whether parts of album `group` of `chat_id` wait already.
-    fn holds(&self, chat_id: i64, group: &str) -> bool {
-        self.waiting
-            .iter()
-            .any(|a| a.chat_id == chat_id && a.group == group)
+    /// When the first hold is due.
+    fn due(&self) -> Option<std::time::Instant> {
+        self.waiting.iter().map(|h| h.due).min()
     }
 
-    /// Hold `msg`, a part of album `group` that came in update `update`;
-    /// the album, when it is full.
+    /// Take `msg`, from update `update`, adding to `ready` what is to go on
+    /// now, in order. Whether it joined messages held already, so no
+    /// other reply is due for it.
+    fn put(
+        &mut self,
+        update: i64,
+        msg: telegram::Message,
+        now: std::time::Instant,
+        ready: &mut Vec<Vec<telegram::Message>>,
+    ) -> bool {
+        if msg.chat.kind != "private" {
+            ready.push(vec![msg]);
+            return false;
+        }
+        let group = msg.media_group_id.clone();
+        if group.is_none() && !gathers(&msg) {
+            self.pass(msg, ready);
+            return false;
+        }
+        let chat_id = msg.chat.id;
+        // A text that replies, quotes or is forwarded starts its own.
+        let joins = (group.is_some() || context_lines(&msg).is_empty())
+            && self
+                .waiting
+                .iter()
+                .any(|h| h.chat_id == chat_id && h.group == group);
+        if !joins {
+            ready.extend(self.take_chat(chat_id));
+        }
+        if let Some(parts) = self.add(group, update, msg, now) {
+            ready.push(parts);
+        }
+        joins
+    }
+
+    /// Add `msg` to `ready`, after what its chat holds.
+    fn pass(&mut self, msg: telegram::Message, ready: &mut Vec<Vec<telegram::Message>>) {
+        ready.extend(self.take_chat(msg.chat.id));
+        ready.push(vec![msg]);
+    }
+
+    /// Hold `msg`, of album `group` or a text, that came in update
+    /// `update`; the hold, when it is full.
     fn add(
         &mut self,
-        group: String,
+        group: Option<String>,
         update: i64,
         msg: telegram::Message,
         now: std::time::Instant,
     ) -> Option<Vec<telegram::Message>> {
         let chat_id = msg.chat.id;
+        let (quiet, most) = match (&group, msg.text.as_deref()) {
+            (None, Some(text)) if text.encode_utf16().count() < TEXT_SPLIT => {
+                (TEXT_QUIET, TEXT_PARTS)
+            }
+            (None, _) => (ALBUM_QUIET, TEXT_PARTS),
+            (Some(_), _) => (ALBUM_QUIET, ALBUM_PARTS),
+        };
         let found = self
             .waiting
             .iter()
-            .position(|a| a.chat_id == chat_id && a.group == group);
+            .position(|h| h.chat_id == chat_id && h.group == group);
         let at = if let Some(at) = found {
             at
         } else {
-            self.waiting.push(Album {
+            self.waiting.push(Hold {
                 chat_id,
                 group,
                 parts: Vec::new(),
                 first_update: update,
-                last: now,
+                due: now,
             });
             self.waiting.len() - 1
         };
-        let album = &mut self.waiting[at];
-        album.parts.push(msg);
-        album.last = now;
-        (album.parts.len() >= ALBUM_PARTS).then(|| self.waiting.remove(at).parts)
+        let hold = &mut self.waiting[at];
+        hold.parts.push(msg);
+        hold.due = now + quiet;
+        (hold.parts.len() >= most).then(|| self.waiting.remove(at).parts)
     }
 
-    /// The albums of `chat_id`, for a message that came after them.
+    /// What `chat_id` holds, for a message that came after it.
     fn take_chat(&mut self, chat_id: i64) -> Vec<Vec<telegram::Message>> {
-        self.take(|a| a.chat_id == chat_id)
+        self.take(|h| h.chat_id == chat_id)
     }
 
-    /// The albums no part came for in [`ALBUM_QUIET`].
-    fn take_quiet(&mut self, now: std::time::Instant) -> Vec<Vec<telegram::Message>> {
-        self.take(|a| now.duration_since(a.last) >= ALBUM_QUIET)
+    /// The holds no part came for in time.
+    fn take_due(&mut self, now: std::time::Instant) -> Vec<Vec<telegram::Message>> {
+        self.take(|h| h.due <= now)
     }
 
-    fn take(&mut self, done: impl Fn(&Album) -> bool) -> Vec<Vec<telegram::Message>> {
-        let (taken, kept): (Vec<Album>, Vec<Album>) = std::mem::take(&mut self.waiting)
+    fn take(&mut self, done: impl Fn(&Hold) -> bool) -> Vec<Vec<telegram::Message>> {
+        let (taken, kept): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.waiting)
             .into_iter()
-            .partition(|a| done(a));
+            .partition(|h| done(h));
         self.waiting = kept;
-        taken.into_iter().map(|a| a.parts).collect()
+        taken.into_iter().map(|h| h.parts).collect()
     }
 }
 
-/// `msgs`, one message or an album's parts, as one inbound frame.
+/// Whether `msg` is a text that may go together with texts sent right
+/// before or after it; a command goes on at once.
+fn gathers(msg: &telegram::Message) -> bool {
+    msg.media_group_id.is_none() && msg.text.as_deref().is_some_and(|t| !t.starts_with('/'))
+}
+
+/// `msgs`, one message, an album's parts or texts gathered, as one inbound
+/// frame.
 async fn translate(
     msgs: &[telegram::Message],
     tg: &Telegram,
@@ -444,8 +492,11 @@ async fn translate(
             phone_number: Some(c.phone_number.clone()),
             vcard: c.vcard.clone(),
         }
-    } else if let Some(text) = &msg.text {
-        ChannelMessageContent::Text { text: text.clone() }
+    } else if msg.text.is_some() {
+        let texts: Vec<&str> = msgs.iter().filter_map(|m| m.text.as_deref()).collect();
+        ChannelMessageContent::Text {
+            text: texts.join("\n"),
+        }
     } else if msgs.len() > 1 {
         album_content(msgs, tg, gateway, &sender_id, &mut attachments).await
     } else {
@@ -462,8 +513,8 @@ async fn translate(
         timestamp,
         // Stash the original payload for audit and so the agent can
         // inspect telegram-specific bits (username, first_name,
-        // forward_from, …) if a future skill teaches it to; every part of
-        // an album.
+        // forward_from, …) if a future skill teaches it to; every message
+        // gathered.
         raw: if msgs.len() > 1 {
             serde_json::to_value(msgs).ok()
         } else {
@@ -1642,54 +1693,115 @@ mod tests {
             m.chat.id = chat;
             m
         };
-        let mut albums = Albums::default();
-        assert!(
-            albums
-                .add("g".into(), 1 + 100, part(1, "g", 5), now)
-                .is_none()
-        );
-        assert!(albums.holds(5, "g"));
-        assert!(!albums.holds(6, "g"));
-        assert!(
-            albums
-                .add("g".into(), 2 + 100, part(2, "g", 5), now)
-                .is_none()
-        );
-        assert!(
-            albums
-                .add("h".into(), 3 + 100, part(3, "h", 6), now)
-                .is_none()
-        );
-        assert_eq!(
-            albums.first_update(),
-            Some(101),
-            "polls keep the first part"
-        );
-        assert_eq!(albums.take_quiet(now + Duration::from_millis(500)).len(), 0);
-        let other = albums.take_chat(6);
+        let mut held = Held::default();
+        let mut ready = Vec::new();
+        assert!(!held.put(1 + 100, part(1, "g", 5), now, &mut ready));
+        assert!(held.put(2 + 100, part(2, "g", 5), now, &mut ready));
+        assert!(!held.put(3 + 100, part(3, "h", 6), now, &mut ready));
+        assert!(ready.is_empty());
+        assert_eq!(held.first_update(), Some(101), "polls keep the first part");
+        assert_eq!(held.due(), Some(now + ALBUM_QUIET));
+        assert_eq!(held.take_due(now + Duration::from_millis(500)).len(), 0);
+        let other = held.take_chat(6);
         assert_eq!(
             other.len(),
             1,
             "a later message of chat 6 sends its album first"
         );
-        let done = albums.take_quiet(now + ALBUM_QUIET);
+        let done = held.take_due(now + ALBUM_QUIET);
         assert_eq!(done.len(), 1);
-        assert_eq!(
-            done[0].iter().map(|m| m.message_id).collect::<Vec<_>>(),
-            [1, 2]
-        );
-        assert!(albums.is_empty());
-        assert_eq!(albums.first_update(), None);
-        for id in 0..9 {
-            assert!(
-                albums
-                    .add("full".into(), id + 100, part(id, "full", 5), now)
-                    .is_none()
-            );
+        assert_eq!(ids(&done[0]), [1, 2]);
+        assert!(held.is_empty());
+        assert_eq!(held.first_update(), None);
+        for id in 0..10 {
+            held.put(id + 100, part(id, "full", 5), now, &mut ready);
         }
-        let full = albums.add("full".into(), 9 + 100, part(9, "full", 5), now);
-        assert_eq!(full.map(|parts| parts.len()), Some(ALBUM_PARTS));
-        assert!(albums.is_empty());
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].len(), ALBUM_PARTS);
+        assert!(held.is_empty());
+    }
+
+    fn ids(msgs: &[telegram::Message]) -> Vec<i64> {
+        msgs.iter().map(|m| m.message_id).collect()
+    }
+
+    #[test]
+    fn texts_sent_in_quick_succession_go_as_one() {
+        let now = std::time::Instant::now();
+        let text =
+            |id: i64, text: &str| message(serde_json::json!({"message_id": id, "text": text}));
+        let mut held = Held::default();
+        let mut ready = Vec::new();
+
+        // A text waits briefly for another.
+        assert!(!held.put(1, text(1, "hi"), now, &mut ready));
+        assert_eq!(held.due(), Some(now + TEXT_QUIET));
+        assert!(held.take_due(now + Duration::from_millis(200)).is_empty());
+        let later = now + Duration::from_millis(200);
+        assert!(held.put(2, text(2, "and this"), later, &mut ready));
+        assert!(
+            held.take_due(now + TEXT_QUIET).is_empty(),
+            "the window starts again"
+        );
+        let done = held.take_due(later + TEXT_QUIET);
+        assert_eq!(done.len(), 1);
+        assert_eq!(ids(&done[0]), [1, 2]);
+
+        // A long paste, split by the app near 4096: its parts wait longer.
+        let part = "x".repeat(4096);
+        assert!(!held.put(3, text(3, &part), now, &mut ready));
+        assert!(held.take_due(now + TEXT_QUIET).is_empty());
+        let later = now + Duration::from_millis(1000);
+        assert!(held.put(4, text(4, &part), later, &mut ready));
+        assert!(held.put(5, text(5, &"y".repeat(1808)), later, &mut ready));
+        assert!(held.take_due(later + Duration::from_millis(200)).is_empty());
+        let done = held.take_due(later + TEXT_QUIET);
+        assert_eq!(ids(&done[0]), [3, 4, 5]);
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn what_is_held_goes_before_the_message_after_it() {
+        let now = std::time::Instant::now();
+        let text =
+            |id: i64, text: &str| message(serde_json::json!({"message_id": id, "text": text}));
+        let mut held = Held::default();
+        let mut ready = Vec::new();
+
+        held.put(1, text(1, "look"), now, &mut ready);
+        let album = message(serde_json::json!({"message_id": 2, "media_group_id": "g"}));
+        assert!(
+            !held.put(2, album, now, &mut ready),
+            "an album is not a text"
+        );
+        assert_eq!(ready.iter().map(|m| ids(m)).collect::<Vec<_>>(), [vec![1]]);
+        held.put(3, text(3, "/stop"), now, &mut ready);
+        assert_eq!(
+            ready.iter().map(|m| ids(m)).collect::<Vec<_>>(),
+            [vec![1], vec![2], vec![3]],
+            "a command goes at once, after the album"
+        );
+        assert!(held.is_empty());
+
+        // A reply starts its own message; a press is never gathered.
+        ready.clear();
+        held.put(4, text(4, "one"), now, &mut ready);
+        let reply = message(serde_json::json!({"message_id": 5, "text": "two",
+            "reply_to_message": {"message_id": 1, "date": 0, "chat": {"id": 5, "type": "private"}}}));
+        assert!(!held.put(5, reply, now, &mut ready));
+        held.pass(text(6, "choice"), &mut ready);
+        assert_eq!(
+            ready.iter().map(|m| ids(m)).collect::<Vec<_>>(),
+            [vec![4], vec![5], vec![6]]
+        );
+
+        // Other chats are not held.
+        ready.clear();
+        let mut group = text(7, "hey");
+        group.chat.kind = "group".into();
+        assert!(!held.put(7, group, now, &mut ready));
+        assert_eq!(ready.len(), 1);
+        assert!(held.is_empty());
     }
 
     #[test]
