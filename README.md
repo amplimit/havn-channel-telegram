@@ -43,9 +43,10 @@ In the gateway's `config.toml` (`~/.config/havn/config.toml` for the user the ga
 [[channels.telegram.accounts]]
 id                = "acme-bot"
 adapter_token_ref = "secret:channel:telegram:acme-bot"
+bot_username      = "acme_bot"           # the bot's username, for the dashboard's connect links
 dm_policy         = "allowlist"          # or "open": anyone who finds the bot
-allow_from        = ["tg:123456789"]     # Telegram user ids allowed to talk to it
-admins            = ["tg:123456789"]     # may use the admin commands (/model, /approve, ...)
+allow_from        = ["tg:123456789"]     # other people's Telegram user ids allowed to talk to it
+admins            = ["tg:123456789"]     # people without a Havn account who may use the admin commands (/model, /approve, ...)
 
 [[bindings]]
 agent_id   = "<id of the agent that answers, from `havn agent list`>"
@@ -54,6 +55,8 @@ account_id = "acme-bot"
 ```
 
 A sender id is `tg:` and the person's numeric Telegram user id (bots such as @userinfobot show it). Instead of listing everyone in `allow_from`, you can hand out one-time invite codes; see below.
+
+Do not list your own Telegram account here to talk to your agent: connect it instead (step 7). An account in `allow_from` or admitted with an invite code is answered as someone else's, whoever it is.
 
 Changes to `[[channels]]` and `[[bindings]]` apply when the gateway restarts: `systemctl restart havn` under the systemd unit, `havn gateway restart` for a gateway started with `havn gateway start`.
 
@@ -134,9 +137,20 @@ With `dm_policy = "allowlist"`, only senders in `allow_from` and senders admitte
 
 ```bash
 havn invite create --channel telegram --account acme-bot              # expires in 24h
-havn access list --channel telegram --account acme-bot                # who may talk to it
+havn access list --channel telegram --account acme-bot                # who may talk to it, and who each is linked to
 havn access revoke --channel telegram --account acme-bot tg:123456789 # take it back
 ```
+
+### 7. Connect your own account
+
+Letting a Telegram account talk to the bot (`allow_from`, an invite code, `dm_policy = "open"`) does not tell Havn whose it is: the gateway answers it as someone other than the agent's owner. For the account you use yourself, open the agent's settings page in the dashboard, then **chat apps** > **connect**, and open the link it shows (`https://t.me/<bot_username>?start=<code>`) or send the bot `/start <code>` (a bare code is passed on to the agent when the bot already answers you); the bot replies "Connected to Havn account <name>." Do this even if the bot already answers you; the account stays admitted as before, and **chat apps** then lists it.
+
+Until it is connected, the bot treats you as someone else (see [Channel Adapters](https://github.com/amplimit/Havn#channel-adapters) and [Tools in other people's conversations](https://github.com/amplimit/Havn#tools-in-other-peoples-conversations) in the Havn README):
+
+- the agent's shell, file and memory tools wait for your approval, which reaches only the dashboard's web chat;
+- nothing you say there changes the agent's memory;
+- the admin commands (`/model`, ...) need your id in `admins`, and even then the calls that wait for the owner (shell, files, memory, MCP) are approved only from the web chat;
+- these chats are not listed in the web chat nor searched with your others.
 
 ## Check that it works
 
@@ -153,6 +167,8 @@ If it does not answer:
 1. `havn doctor` checks the gateway; `havn agent list` shows whether the bound agent exists and runs (as the gateway's user, as above).
 2. In the daemon's log, a refused connection means the adapter token does not match the credential, or `channel_id` / `account_id` do not match an account in the gateway's config.
 3. In the gateway's log (`journalctl -u havn`), a message from a sender who is not allowed is refused there: add them to `allow_from` or give them an invite code.
+
+If the bot answers you but treats you as someone else (it asks your approval in the web chat for its own tools, does not remember what you tell it, or refuses `/model`), your account is admitted but not connected: see step 7. `havn access list` shows `linked="<name>"` beside a sender let in by `allow_from` or an invite that is connected, and nothing beside one that is not.
 
 ## Limitations
 
