@@ -37,6 +37,12 @@ jobs:
         env:
           TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
         run: |
+          # A manual run builds the ref it was started from, so for a tag
+          # it must be started from that tag.
+          if [ "$GITHUB_REF" != "refs/tags/$TAG" ]; then
+            echo "::error::run it from the tag: gh workflow run release.yml --ref $TAG -f tag=$TAG"
+            exit 1
+          fi
           version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
           echo "crate version: ${version:-<none>}"
           if [ "$TAG" != "v$version" ]; then
