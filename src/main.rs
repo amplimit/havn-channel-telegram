@@ -199,15 +199,23 @@ async fn telegram_inbound_loop(
     let mut held = Held::default();
     loop {
         let offset = held.first_update().map_or(next, |first| first.min(next));
-        // While messages are held, the next poll waits until the first of
-        // them is due and asks for what came meanwhile, so they go on then
-        // unless more came.
-        if let Some(due) = held.due() {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
-        }
-        let updates = match tg.get_updates(offset, !held.is_empty()).await {
-            Ok(u) => u,
-            Err(e) => {
+        // While messages are held, the poll is given up when the first of
+        // them is due, so they go on then; what it would have brought comes
+        // again with the next, as the offset is the same.
+        let poll = tg.get_updates(offset);
+        let polled = match held.due() {
+            Some(due) => {
+                tokio::select! {
+                    polled = poll => Some(polled),
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => None,
+                }
+            }
+            None => Some(poll.await),
+        };
+        let updates = match polled {
+            None => Vec::new(),
+            Some(Ok(u)) => u,
+            Some(Err(e)) => {
                 warn!(error = %e, "telegram getUpdates failed; backing off 5s");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 Vec::new()
@@ -316,10 +324,6 @@ struct Hold {
 }
 
 impl Held {
-    fn is_empty(&self) -> bool {
-        self.waiting.is_empty()
-    }
-
     /// The update the first waiting part came in.
     fn first_update(&self) -> Option<i64> {
         self.waiting.iter().map(|h| h.first_update).min()
@@ -344,18 +348,25 @@ impl Held {
             ready.push(vec![msg]);
             return false;
         }
+        let chat_id = msg.chat.id;
         let group = msg.media_group_id.clone();
-        if group.is_none() && !gathers(&msg) {
+        // What follows a part of a long paste is its next part, even when
+        // the app's split puts a `/` first.
+        let pasted = self
+            .waiting
+            .iter()
+            .any(|h| h.chat_id == chat_id && h.group.is_none() && h.parts.last().is_some_and(long));
+        if group.is_none() && (msg.text.is_none() || command(&msg) && !pasted) {
             self.pass(msg, ready);
             return false;
         }
-        let chat_id = msg.chat.id;
-        // A text that replies, quotes or is forwarded starts its own.
+        // A text that replies, quotes or is forwarded starts its own, and
+        // so does anything after a hold that is due already.
         let joins = (group.is_some() || context_lines(&msg).is_empty())
             && self
                 .waiting
                 .iter()
-                .any(|h| h.chat_id == chat_id && h.group == group);
+                .any(|h| h.chat_id == chat_id && h.group == group && now < h.due);
         if !joins {
             ready.extend(self.take_chat(chat_id));
         }
@@ -381,12 +392,10 @@ impl Held {
         now: std::time::Instant,
     ) -> Option<Vec<telegram::Message>> {
         let chat_id = msg.chat.id;
-        let (quiet, most) = match (&group, msg.text.as_deref()) {
-            (None, Some(text)) if text.encode_utf16().count() < TEXT_SPLIT => {
-                (TEXT_QUIET, TEXT_PARTS)
-            }
-            (None, _) => (ALBUM_QUIET, TEXT_PARTS),
-            (Some(_), _) => (ALBUM_QUIET, ALBUM_PARTS),
+        let (quiet, most) = match &group {
+            None if long(&msg) => (ALBUM_QUIET, TEXT_PARTS),
+            None => (TEXT_QUIET, TEXT_PARTS),
+            Some(_) => (ALBUM_QUIET, ALBUM_PARTS),
         };
         let found = self
             .waiting
@@ -429,10 +438,22 @@ impl Held {
     }
 }
 
-/// Whether `msg` is a text that may go together with texts sent right
-/// before or after it; a command goes on at once.
-fn gathers(msg: &telegram::Message) -> bool {
-    msg.media_group_id.is_none() && msg.text.as_deref().is_some_and(|t| !t.starts_with('/'))
+/// Whether `msg` is a command (`/name` or `/name@bot`, then anything),
+/// which goes on at once rather than with texts sent around it.
+fn command(msg: &telegram::Message) -> bool {
+    let Some(name) = msg.text.as_deref().and_then(|t| t.strip_prefix('/')) else {
+        return false;
+    };
+    let name = name.split(char::is_whitespace).next().unwrap_or_default();
+    let name = name.split_once('@').map_or(name, |(name, _)| name);
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Whether `msg` is a text near where the Telegram app splits a long paste.
+fn long(msg: &telegram::Message) -> bool {
+    msg.text
+        .as_deref()
+        .is_some_and(|t| t.encode_utf16().count() >= TEXT_SPLIT)
 }
 
 /// `msgs`, one message, an album's parts or texts gathered, as one inbound
@@ -1711,14 +1732,14 @@ mod tests {
         let done = held.take_due(now + ALBUM_QUIET);
         assert_eq!(done.len(), 1);
         assert_eq!(ids(&done[0]), [1, 2]);
-        assert!(held.is_empty());
+        assert!(held.waiting.is_empty());
         assert_eq!(held.first_update(), None);
         for id in 0..10 {
             held.put(id + 100, part(id, "full", 5), now, &mut ready);
         }
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].len(), ALBUM_PARTS);
-        assert!(held.is_empty());
+        assert!(held.waiting.is_empty());
     }
 
     fn ids(msgs: &[telegram::Message]) -> Vec<i64> {
@@ -1750,14 +1771,33 @@ mod tests {
         // A long paste, split by the app near 4096: its parts wait longer.
         let part = "x".repeat(4096);
         assert!(!held.put(3, text(3, &part), now, &mut ready));
-        assert!(held.take_due(now + TEXT_QUIET).is_empty());
-        let later = now + Duration::from_millis(1000);
+        let later = now + Duration::from_millis(1400);
+        assert!(held.take_due(later).is_empty());
         assert!(held.put(4, text(4, &part), later, &mut ready));
-        assert!(held.put(5, text(5, &"y".repeat(1808)), later, &mut ready));
+        // A part may start with a `/`, where the app split.
+        let last = format!("/var/log/{}", "y".repeat(1800));
+        assert!(held.put(5, text(5, &last), later, &mut ready));
         assert!(held.take_due(later + Duration::from_millis(200)).is_empty());
         let done = held.take_due(later + TEXT_QUIET);
         assert_eq!(ids(&done[0]), [3, 4, 5]);
         assert!(ready.is_empty());
+
+        // A hold that is due takes no more, even before it has gone on.
+        held.put(6, text(6, "one"), now, &mut ready);
+        assert!(!held.put(7, text(7, "two"), now + TEXT_QUIET, &mut ready));
+        assert_eq!(ready.iter().map(|m| ids(m)).collect::<Vec<_>>(), [vec![6]]);
+    }
+
+    #[test]
+    fn commands_are_told_from_texts() {
+        let is = |text: &str| command(&message(serde_json::json!({"text": text})));
+        for text in ["/stop", "/model gpt", "/new@acme_bot", "/start@acme_bot x"] {
+            assert!(is(text), "{text}");
+        }
+        for text in ["/var/log/syslog", "/", "/ stop", "hi /stop", "/über"] {
+            assert!(!is(text), "{text}");
+        }
+        assert!(!command(&message(serde_json::json!({"caption": "/stop"}))));
     }
 
     #[test]
@@ -1781,7 +1821,7 @@ mod tests {
             [vec![1], vec![2], vec![3]],
             "a command goes at once, after the album"
         );
-        assert!(held.is_empty());
+        assert!(held.waiting.is_empty());
 
         // A reply starts its own message; a press is never gathered.
         ready.clear();
@@ -1801,7 +1841,7 @@ mod tests {
         group.chat.kind = "group".into();
         assert!(!held.put(7, group, now, &mut ready));
         assert_eq!(ready.len(), 1);
-        assert!(held.is_empty());
+        assert!(held.waiting.is_empty());
     }
 
     #[test]
