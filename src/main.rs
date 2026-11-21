@@ -253,9 +253,7 @@ async fn telegram_inbound_loop(
             if let Some(change) = update.my_chat_member {
                 if change.chat.kind == "group" || change.chat.kind == "supergroup" {
                     let (old, new) = (&change.old_chat_member, &change.new_chat_member);
-                    let added = !in_chat(old)
-                        && in_chat(new)
-                        && !matches!(new.status.as_str(), "creator" | "administrator");
+                    let added = !in_chat(old) && in_chat(new);
                     let joined_sees_all = if added { privacy_now(&tg).await } else { false };
                     note_status(change.chat.id, old, new, || joined_sees_all);
                 }
@@ -741,8 +739,8 @@ fn note_status(
     }
     let admin = matches!(new.status.as_str(), "creator" | "administrator");
     let joined = !in_chat(old);
-    let joined_with = (joined && !admin).then(joined_sees_all);
-    if joined_with == Some(false) {
+    let joined_with = joined.then(joined_sees_all);
+    if joined_with == Some(false) && !admin {
         warn!(
             chat_id,
             "added to a group in privacy mode: {PRIVACY_ADVICE}"
@@ -807,9 +805,15 @@ fn learn_group(msg: &telegram::Message, me: &telegram::TelegramUser) {
         }
         change_group(chat_id, |_| None);
     } else if shows_all_seen(msg, me) {
+        // Shown while a member: privacy mode was off as it was added.
         change_group(chat_id, |known| {
             Some(Known {
                 shown: true,
+                joined: if known.admin {
+                    known.joined
+                } else {
+                    Some(true)
+                },
                 ..known
             })
         });
@@ -2259,17 +2263,19 @@ mod tests {
         );
         assert_eq!(group_sees_all(-7002), None);
         assert_eq!(group_sees_all(-1_007_002), Some(true));
-        // Added as an administrator; removed.
-        note_status(
-            -7004,
-            &status("left"),
-            &status("administrator"),
-            || unreachable!(),
-        );
+        // Added as an administrator in privacy mode: back to it as a member; removed.
+        note_status(-7004, &status("left"), &status("administrator"), || false);
         assert_eq!(group_sees_all(-7004), Some(true));
         note_status(
             -7004,
             &status("administrator"),
+            &status("member"),
+            || unreachable!(),
+        );
+        assert_eq!(group_sees_all(-7004), Some(false));
+        note_status(
+            -7004,
+            &status("member"),
             &status("kicked"),
             || unreachable!(),
         );
@@ -2277,6 +2283,20 @@ mod tests {
         // Not known (joined before the daemon), shown by a message only such a bot gets.
         assert_eq!(group_sees_all(-7003), None);
         learn_group(&in_group(-7003, serde_json::json!({"text": "lunch?"})), &me);
+        assert_eq!(group_sees_all(-7003), Some(true));
+        // Shown as a member, it was added with privacy mode off: that outlives a promotion.
+        note_status(
+            -7003,
+            &status("member"),
+            &status("administrator"),
+            || unreachable!(),
+        );
+        note_status(
+            -7003,
+            &status("administrator"),
+            &status("member"),
+            || unreachable!(),
+        );
         assert_eq!(group_sees_all(-7003), Some(true));
         let change: telegram::ChatMemberUpdated = serde_json::from_value(serde_json::json!({
             "chat": {"id": -7005, "type": "supergroup"},
