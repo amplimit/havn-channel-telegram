@@ -109,7 +109,9 @@ async fn main() -> Result<()> {
         bot = me.username.as_deref().unwrap_or_default(),
         "telegram bot identified"
     );
-    note_privacy(&me);
+    if !note_privacy(&me) {
+        warn!("privacy mode is on: {PRIVACY_ADVICE}");
+    }
     // Voice messages go to the gateway, which transcribes them (havn
     // issue #164).
     if cfg.openai_api_key.is_some() || cfg.whisper_base_url.is_some() || cfg.whisper_model.is_some()
@@ -283,16 +285,8 @@ async fn telegram_inbound_loop(
             // the reply comes (issue #12); only for private chats: a group
             // message may get no reply. What is gathered is
             // one message, with one reply.
-            // Privacy mode changes for a group when the bot is added to
-            // it again, so it is read again then.
-            if msg.new_chat_members.iter().any(|m| m.id == me.id) {
-                let tg = tg.clone();
-                tokio::spawn(async move {
-                    match tg.get_me().await {
-                        Ok(me) => note_privacy(&me),
-                        Err(e) => warn!(error = %e, "telegram getMe failed"),
-                    }
-                });
+            if msg.chat.kind == "group" || msg.chat.kind == "supergroup" {
+                learn_group(&tg, &msg, &me).await;
             }
             let (chat_id, private) = (msg.chat.id, msg.chat.kind == "private");
             if !held.put(update.update_id, msg, std::time::Instant::now(), &mut ready) && private {
@@ -543,40 +537,116 @@ fn long(msg: &telegram::Message) -> bool {
         .is_some_and(|t| t.encode_utf16().count() >= TEXT_SPLIT)
 }
 
-/// Whether the bot sees every message in groups: privacy mode off, as
-/// `getMe` last said.
+/// Whether the bot sees every message in groups (privacy mode off), as
+/// `getMe` last said: what a group it is added to gets, as Telegram fixes
+/// the mode of a group when the bot is added to it.
 static SEES_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Groups where the bot was given a message that does not address it, so
-/// it sees every message there (as their administrator) whatever its
-/// privacy mode.
-static SEEN_ALL_IN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+/// Per group, whether the bot sees every message there, where known: from
+/// its privacy mode when it was added, or shown by a message the bot gets
+/// only when it does (as the group's administrator, say).
+static GROUP_SEES_ALL: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, bool>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// Groups `GROUP_SEES_ALL` keeps at most.
+const GROUPS_KNOWN: usize = 10_000;
+
 /// Note whether `me`, as `getMe` gave it, sees every message in groups;
-/// warn when it does not, as mentions in groups then never reach it.
-fn note_privacy(me: &telegram::TelegramUser) {
+/// whether it does.
+fn note_privacy(me: &telegram::TelegramUser) -> bool {
     let sees_all = me.can_read_all_group_messages.unwrap_or(false);
     SEES_ALL.store(sees_all, Ordering::Relaxed);
-    if !sees_all {
-        warn!(
-            "privacy mode is on: in a group, the bot gets only commands to it and replies to its messages, \
-             not mentions; turn it off with BotFather (/setprivacy), then remove the bot from each group \
-             and add it again, or make it an administrator there"
-        );
+    sees_all
+}
+
+/// The advice for a bot in privacy mode, for the log.
+const PRIVACY_ADVICE: &str = "in a group the bot gets only commands to it and replies to its \
+     messages, not mentions; turn privacy mode off with BotFather (/setprivacy), then remove the \
+     bot from the group and add it again, or make it an administrator there";
+
+/// Whether the bot sees every message in group `chat_id`, where known.
+fn group_sees_all(chat_id: i64) -> Option<bool> {
+    GROUP_SEES_ALL.lock().ok()?.get(&chat_id).copied()
+}
+
+/// Note that the bot does (or does not) see every message in `chat_id`.
+fn note_group(chat_id: i64, sees_all: bool) {
+    if let Ok(mut known) = GROUP_SEES_ALL.lock() {
+        if known.len() >= GROUPS_KNOWN && !known.contains_key(&chat_id) {
+            let Some(&any) = known.keys().next() else {
+                return;
+            };
+            known.remove(&any);
+        }
+        known.insert(chat_id, sees_all);
     }
 }
 
-/// Whether the bot sees every message in the group `chat_id`, given one
-/// that does (`addressed`) or does not address it.
-fn sees_all_in(chat_id: i64, addressed: bool) -> bool {
-    let Ok(mut seen) = SEEN_ALL_IN.lock() else {
-        return SEES_ALL.load(Ordering::Relaxed);
-    };
-    if !addressed {
-        seen.insert(chat_id);
+/// Whether `msg` says something: text, a caption, a file, a poll and such,
+/// not a service message (a member joining, a pin, a new title).
+fn says_something(msg: &telegram::Message) -> bool {
+    msg.text.is_some()
+        || msg.caption.is_some()
+        || msg.photo.is_some()
+        || msg.video.is_some()
+        || msg.video_note.is_some()
+        || msg.animation.is_some()
+        || msg.audio.is_some()
+        || msg.voice.is_some()
+        || msg.document.is_some()
+        || msg.sticker.is_some()
+        || msg.poll.is_some()
+        || msg.venue.is_some()
+        || msg.location.is_some()
+        || msg.contact.is_some()
+        || msg.unsupported_content()
+}
+
+/// Whether group message `msg` shows that the bot `me` sees every message
+/// there: one a bot in privacy mode does not get. Those it gets are
+/// service messages, commands, replies, messages sent via a bot, and
+/// (as `addressed` takes them) messages to it.
+fn shows_all_seen(msg: &telegram::Message, me: &telegram::TelegramUser) -> bool {
+    says_something(msg)
+        && msg.reply_to_message.is_none()
+        && msg.via_bot.is_none()
+        && !msg.is_automatic_forward
+        && !command(msg)
+        && !addressed(msg, me)
+}
+
+/// Note what group message `msg` tells of whether the bot `me` sees every
+/// message there: the bot was added (Telegram fixes its privacy mode for
+/// the group then, so `getMe` is asked again), removed, the group moved to
+/// a supergroup, or a message only such a bot gets.
+async fn learn_group(tg: &Telegram, msg: &telegram::Message, me: &telegram::TelegramUser) {
+    let chat_id = msg.chat.id;
+    if msg.new_chat_members.iter().any(|m| m.id == me.id) {
+        let sees_all = match tg.get_me().await {
+            Ok(fresh) => note_privacy(&fresh),
+            Err(e) => {
+                warn!(error = %e, "telegram getMe failed; taking the privacy mode it last gave");
+                SEES_ALL.load(Ordering::Relaxed)
+            }
+        };
+        if !sees_all {
+            warn!(
+                chat_id,
+                "added to a group in privacy mode: {PRIVACY_ADVICE}"
+            );
+        }
+        note_group(chat_id, sees_all);
+    } else if msg.left_chat_member.as_ref().is_some_and(|m| m.id == me.id) {
+        if let Ok(mut known) = GROUP_SEES_ALL.lock() {
+            known.remove(&chat_id);
+        }
+    } else if let Some(to) = msg.migrate_to_chat_id {
+        if let Some(sees_all) = group_sees_all(chat_id) {
+            note_group(to, sees_all);
+        }
+    } else if shows_all_seen(msg, me) {
+        note_group(chat_id, true);
     }
-    SEES_ALL.load(Ordering::Relaxed) || seen.contains(&chat_id)
 }
 
 /// The gateway said it takes group messages (havn issue #263).
@@ -686,10 +756,7 @@ async fn translate(
                     .or_else(|| from.username.clone()),
                 },
                 addressed: msgs.iter().any(|m| addressed(m, me)),
-                sees_all: Some(sees_all_in(
-                    msg.chat.id,
-                    msgs.iter().any(|m| addressed(m, me)),
-                )),
+                sees_all: group_sees_all(msg.chat.id),
             })
         }
         "group" | "supergroup" => {
@@ -716,6 +783,9 @@ async fn translate(
     if let Some(g) = &group
         && !g.addressed
     {
+        if !says_something(msg) {
+            return None;
+        }
         let text = msg
             .text
             .clone()
@@ -1909,30 +1979,70 @@ mod tests {
     }
 
     #[test]
-    fn a_group_says_whether_the_bot_sees_every_message_there() {
+    fn only_a_message_a_bot_in_privacy_mode_never_gets_shows_it_sees_all() {
         let me: telegram::TelegramUser = serde_json::from_value(serde_json::json!({
             "id": 99, "is_bot": true, "username": "acme_bot",
             "can_read_all_group_messages": false
         }))
         .expect("me");
-        note_privacy(&me);
-        assert!(!sees_all_in(-501, true));
-        // Given a message not to it, it sees every message there, as an
-        // administrator.
-        assert!(sees_all_in(-501, false));
-        assert!(sees_all_in(-501, true));
-        assert!(!sees_all_in(-502, true));
-        let added = message(serde_json::json!({
-            "chat": {"id": -502, "type": "group"},
-            "new_chat_members": [{"id": 99, "is_bot": true}]
-        }));
+        let group = |fields: serde_json::Value| {
+            let mut fields = fields;
+            fields["chat"] = serde_json::json!({"id": -100, "type": "group", "title": "Team"});
+            message(fields)
+        };
+        for (fields, shows) in [
+            (serde_json::json!({"text": "lunch?"}), true),
+            (serde_json::json!({"photo": [], "caption": "look"}), true),
+            // What a bot in privacy mode gets anyway.
+            (
+                serde_json::json!({"new_chat_members": [{"id": 99, "is_bot": true}]}),
+                false,
+            ),
+            (serde_json::json!({"new_chat_title": "Team 2"}), false),
+            (serde_json::json!({"text": "/help"}), false),
+            (serde_json::json!({"text": "@acme_bot hi"}), false),
+            (
+                serde_json::json!({"text": "me too", "reply_to_message": {
+                    "message_id": 7, "date": 0, "chat": {"id": -100, "type": "group"},
+                    "from": {"id": 6}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"text": "found it", "via_bot": {"id": 99, "is_bot": true}}),
+                false,
+            ),
+            (
+                serde_json::json!({"text": "news", "is_automatic_forward": true}),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                shows_all_seen(&group(fields.clone()), &me),
+                shows,
+                "{fields}"
+            );
+        }
+        assert!(!note_privacy(&me));
+        let added = group(serde_json::json!({"new_chat_members": [{"id": 99, "is_bot": true}]}));
+        assert!(!says_something(&added));
         assert_eq!(added.new_chat_members[0].id, me.id);
-        let open: telegram::TelegramUser = serde_json::from_value(serde_json::json!({
-            "id": 99, "is_bot": true, "can_read_all_group_messages": true
-        }))
-        .expect("me");
-        note_privacy(&open);
-        assert!(sees_all_in(-502, true));
+        let left = group(serde_json::json!({"left_chat_member": {"id": 99, "is_bot": true}}));
+        assert!(left.left_chat_member.is_some_and(|m| m.id == me.id));
+        let moved = group(serde_json::json!({"migrate_to_chat_id": -1001}));
+        assert_eq!(moved.migrate_to_chat_id, Some(-1001));
+    }
+
+    #[test]
+    fn what_is_known_of_a_group_is_kept_per_group_and_forgotten_when_the_bot_leaves() {
+        note_group(-7001, false);
+        note_group(-7002, true);
+        assert_eq!(group_sees_all(-7001), Some(false));
+        assert_eq!(group_sees_all(-7002), Some(true));
+        assert_eq!(group_sees_all(-7003), None);
+        if let Ok(mut known) = GROUP_SEES_ALL.lock() {
+            known.remove(&-7001);
+        }
+        assert_eq!(group_sees_all(-7001), None);
     }
 
     #[test]

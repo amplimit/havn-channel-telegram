@@ -846,6 +846,15 @@ pub struct Message {
     /// Who was added to the group, in that service message.
     #[serde(default)]
     pub new_chat_members: Vec<TelegramUser>,
+    /// Who left the group, in that service message.
+    #[serde(default)]
+    pub left_chat_member: Option<TelegramUser>,
+    /// The supergroup a group became, in that service message.
+    #[serde(default)]
+    pub migrate_to_chat_id: Option<i64>,
+    /// The bot it was sent via (inline mode).
+    #[serde(default)]
+    pub via_bot: Option<TelegramUser>,
     /// Mentions, commands and such in `text`, and in `caption`.
     #[serde(default)]
     pub entities: Option<Vec<MessageEntity>>,
@@ -898,6 +907,9 @@ impl Message {
             sender_chat: None,
             is_automatic_forward: false,
             new_chat_members: Vec::new(),
+            left_chat_member: None,
+            migrate_to_chat_id: None,
+            via_bot: None,
             entities: None,
             caption_entities: None,
         }
