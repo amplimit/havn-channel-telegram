@@ -6,7 +6,7 @@ It runs as its own process, apart from the gateway, and talks to it over the gat
 
 ## What it does
 
-- **Private chats** with the bot (1:1). Messages in groups, supergroups and channels are dropped.
+- **Private chats** with the bot (1:1), and **groups and supergroups** (see "Groups" below). Posts in channels are dropped.
 - **Text**, and **voice messages**: a voice message goes to the gateway as an audio file (`voice.ogg`), which the gateway transcribes when `[transcription]` is set in its config.toml (see [Voice messages](https://github.com/amplimit/havn#voice-messages) in the Havn README); the agent gets the transcript with the file, or a line saying it was not transcribed. Audio files are passed on the same way.
 - **Locations, venues and contacts**, passed to the agent as such.
 - **Stickers**: their emoji and set as text, and their picture as an image the agent can see when its model takes images. A sticker that moves (animated or video) gives its thumbnail; without one, or if the picture cannot be fetched, only the text comes. The picture is given each time the sticker comes, and counts toward the files a person may send (60 an hour; past that, only the text).
@@ -191,9 +191,24 @@ If it does not answer:
 
 If the bot answers you but treats you as someone else (it asks your approval in the web chat for its own tools, does not remember what you tell it, or refuses `/model`), your account is admitted but not connected: see step 7. `havn access list` shows `linked="<name>"` beside a sender let in by `allow_from` or an invite that is connected, and nothing beside one that is not.
 
+## Groups
+
+Add the bot to a group, and let the group use it on the gateway: the account's `group_policy` in the gateway's config.toml (`off` by default), `allow_groups`, or the agent's settings page (see [Group chats](https://github.com/amplimit/havn#group-chats) in the Havn README). Each group message goes to the gateway with the group (`tg:<chat id>`, its title, the sender's name) and whether it addresses the bot:
+
+- it names the bot (`@acme_bot`, in any case, or a mention of the bot that has no username),
+- it replies to one of the bot's messages,
+- or it is a command, with no bot's name or with this bot's (`/new` or `/new@acme_bot`; `/new@other_bot` is not).
+
+The gateway answers only those. The bot's reply goes to the group as a reply to the message that last addressed it there. The daemon asks Telegram who the bot is (`getMe`) when it starts, and waits until it can.
+
+**Privacy mode.** By default (privacy mode on), Telegram gives a bot in a group only the messages that address it, commands and replies to it: enough to use it. Turn privacy mode off with BotFather (`/setprivacy`, then remove the bot from the group and add it again) for the bot to see the other messages too, which the gateway keeps as context for the next message that addresses it (the last 30). A bot that is a group administrator sees every message whatever the mode.
+
+A typing indicator shows in a group only for a message that addresses the bot.
+
 ## Limitations
 
-- Private chats only; groups, supergroups and channels are dropped.
+- Posts in channels are dropped.
+- A poll the agent sends in a group is answered only by votes in a private chat: a vote in a group is not passed on. Buttons work in groups.
 - An edited message is not passed on: the agent answered the original, and acting on edits would repeat its work. Send a new message instead.
 - A voice message that cannot be downloaded from Telegram reaches the agent only as a note asking for it again.
 - Images in a reply that are not files the agent sent are shown as text (`[image: <url>]`).

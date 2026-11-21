@@ -11,8 +11,10 @@
 //!   Outbound`] frames and call Telegram's `sendMessage` to
 //!   deliver to the right user.
 //!
-//! Group/supergroup/channel messages are dropped with a debug log —
-//! v0.2 supports 1:1 DMs only. On the outbound side every content kind
+//! Group and supergroup messages go on with their group (havn issue
+//! #263), marked as addressed to the bot when they name it, reply to it
+//! or are a command; a reply to a group answers the message that last
+//! addressed the bot there. Channel posts are dropped. On the outbound side every content kind
 //! reaches the user: text through `sendMessage` (with the gateway's
 //! buttons), a poll through `sendPoll` (its text if Telegram refuses
 //! it), and a `File` fetched from the gateway and sent as a photo,
@@ -90,6 +92,20 @@ async fn main() -> Result<()> {
 
     let telegram = Telegram::new(&cfg.bot_api, &cfg.bot_token, cfg.poll_timeout_seconds)
         .context("Telegram client init")?;
+    // Who the bot is, for what in a group addresses it (havn issue #263).
+    let me = loop {
+        match telegram.get_me().await {
+            Ok(me) => break Arc::new(me),
+            Err(e) => {
+                warn!(error = %e, "telegram getMe failed; retrying in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
+    info!(
+        bot = me.username.as_deref().unwrap_or_default(),
+        "telegram bot identified"
+    );
     // Voice messages go to the gateway, which transcribes them (havn
     // issue #164).
     if cfg.openai_api_key.is_some() || cfg.whisper_base_url.is_some() || cfg.whisper_model.is_some()
@@ -149,6 +165,7 @@ async fn main() -> Result<()> {
         outbound_tx.clone(),
         cfg.account_id.clone(),
         typing.clone(),
+        me,
     ));
     let outbound_task = tokio::spawn(havn_outbound_loop(
         telegram.clone(),
@@ -189,6 +206,7 @@ async fn telegram_inbound_loop(
     outbound_tx: tokio::sync::mpsc::Sender<ChannelFrame>,
     account_id: String,
     typing: Typing,
+    me: Arc<telegram::TelegramUser>,
 ) -> Result<()> {
     let seq = Arc::new(AtomicU64::new(1));
     // The next update not seen yet. Telegram forgets the updates before
@@ -256,14 +274,24 @@ async fn telegram_inbound_loop(
             // group messages are dropped by translate. What is gathered is
             // one message, with one reply.
             let (chat_id, private) = (msg.chat.id, msg.chat.kind == "private");
-            if !held.put(update.update_id, msg, std::time::Instant::now(), &mut ready) && private {
+            // In a group, only a message to the bot gets a reply.
+            let answered = private || addressed(&msg, &me);
+            if !held.put(update.update_id, msg, std::time::Instant::now(), &mut ready) && answered {
                 typing.start(chat_id);
             }
         }
         ready.extend(held.take_due(std::time::Instant::now()));
         for msgs in ready {
             let chat_id = msgs[0].chat.id;
-            let frame = translate(&msgs, &tg, &gateway, &account_id, &seq).await;
+            let frame = translate(&msgs, &tg, &gateway, &account_id, &seq, &me).await;
+            // A reply to a group answers the message that addressed the bot.
+            if let Some(ChannelFrame::Inbound(inbound)) = &frame
+                && inbound.group.as_ref().is_some_and(|g| g.addressed)
+                && let Some(last) = msgs.last()
+                && let Ok(mut answering) = ANSWERING.lock()
+            {
+                answering.insert(chat_id, last.message_id);
+            }
             // A service message gets no reply.
             if frame.is_none() {
                 typing.replied(chat_id);
@@ -504,23 +532,95 @@ fn long(msg: &telegram::Message) -> bool {
 
 /// `msgs`, one message, an album's parts or texts gathered, as one inbound
 /// frame.
+/// The message of each group that last addressed the bot, by chat: what
+/// a reply there answers (havn issue #263).
+static ANSWERING: std::sync::LazyLock<Mutex<HashMap<i64, i64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether group message `msg` is to the bot `me`: it replies to one of
+/// the bot's messages, is a command (not for another bot), or names it,
+/// by `@username` or a mention of the bot itself.
+fn addressed(msg: &telegram::Message, me: &telegram::TelegramUser) -> bool {
+    if msg
+        .reply_to_message
+        .as_ref()
+        .and_then(|r| r.from.as_ref())
+        .is_some_and(|u| u.id == me.id)
+    {
+        return true;
+    }
+    let text = msg
+        .text
+        .as_deref()
+        .or(msg.caption.as_deref())
+        .unwrap_or_default();
+    let username = me.username.as_deref().unwrap_or_default();
+    if let Some(command) = text.strip_prefix('/') {
+        let word = command.split_whitespace().next().unwrap_or_default();
+        return match word.split_once('@') {
+            Some((_, bot)) => !username.is_empty() && bot.eq_ignore_ascii_case(username),
+            None => true,
+        };
+    }
+    let named = msg
+        .entities
+        .iter()
+        .chain(msg.caption_entities.iter())
+        .flatten()
+        .any(|e| e.kind == "text_mention" && e.user.as_ref().is_some_and(|u| u.id == me.id));
+    named || (!username.is_empty() && mentions(text, username))
+}
+
+/// Whether `text` has `@username`, in any case, not run into a longer
+/// name.
+fn mentions(text: &str, username: &str) -> bool {
+    let wanted = format!("@{}", username.to_ascii_lowercase());
+    let lower = text.to_ascii_lowercase();
+    lower.match_indices(&wanted).any(|(at, _)| {
+        !lower[at + wanted.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
 async fn translate(
     msgs: &[telegram::Message],
     tg: &Telegram,
     gateway: &Gateway,
     account_id: &str,
     seq: &Arc<AtomicU64>,
+    me: &telegram::TelegramUser,
 ) -> Option<ChannelFrame> {
     let msg = msgs.first()?;
-    if msg.chat.kind != "private" {
-        debug!(
-            chat_kind = %msg.chat.kind,
-            chat_id = msg.chat.id,
-            "dropping non-private chat message (v0.2 supports 1:1 DMs only)"
-        );
-        return None;
-    }
     let from = msg.from.as_ref()?;
+    // A group's message goes with its group (havn issue #263); a
+    // channel's posts are not people writing to the bot.
+    let group = match msg.chat.kind.as_str() {
+        "private" => None,
+        "group" | "supergroup" => Some(crate::types::ChannelGroup {
+            id: format!("tg:{}", msg.chat.id),
+            title: msg.chat.title.clone(),
+            sender_name: Some(
+                [from.first_name.as_deref(), from.last_name.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+            .filter(|name| !name.is_empty())
+            .or_else(|| from.username.clone()),
+            addressed: msgs.iter().any(|m| addressed(m, me)),
+        }),
+        other => {
+            debug!(
+                chat_kind = other,
+                chat_id = msg.chat.id,
+                "dropping a message of a channel"
+            );
+            return None;
+        }
+    };
 
     let timestamp = chrono::DateTime::from_timestamp(msg.date, 0).unwrap_or_else(chrono::Utc::now);
     let sender_id = format!("tg:{}", from.id);
@@ -588,6 +688,7 @@ async fn translate(
             serde_json::to_value(msg).ok()
         },
         attachments,
+        group,
     };
     Some(ChannelFrame::Inbound(inbound))
 }
@@ -1449,7 +1550,18 @@ async fn deliver_outbound(tg: &Telegram, gateway: &Gateway, o: &ChannelOutbound)
     let chat_id = chat_of(&o.to)
         .ok_or_else(|| anyhow::anyhow!("outbound `to` not in tg:<id> format: {:?}", o.to))?;
 
-    let reply_to_message_id = o.in_reply_to.as_deref().and_then(parse_message_id);
+    // In a group, a reply answers the message that last addressed the bot
+    // there (havn issue #263).
+    let reply_to_message_id = o
+        .in_reply_to
+        .as_deref()
+        .and_then(parse_message_id)
+        .or_else(|| {
+            ANSWERING
+                .lock()
+                .ok()
+                .and_then(|answering| answering.get(&chat_id).copied())
+        });
 
     // A question of several answers goes as a poll; its text, if the poll
     // is refused.
@@ -1612,6 +1724,56 @@ mod tests {
             .expect("object")
             .extend(fields.as_object().expect("object").clone());
         serde_json::from_value(m).expect("message")
+    }
+
+    #[test]
+    fn a_group_message_addresses_the_bot_by_name_reply_or_command() {
+        let me: telegram::TelegramUser = serde_json::from_value(
+            serde_json::json!({"id": 99, "is_bot": true, "username": "acme_bot"}),
+        )
+        .expect("me");
+        let group = |fields: serde_json::Value| {
+            let mut fields = fields;
+            fields["chat"] = serde_json::json!({"id": -100, "type": "supergroup", "title": "Team"});
+            message(fields)
+        };
+        for (fields, to_bot) in [
+            (
+                serde_json::json!({"text": "hi @acme_bot, a question"}),
+                true,
+            ),
+            (serde_json::json!({"text": "hi @ACME_BOT"}), true),
+            (serde_json::json!({"text": "hi @acme_bot_two"}), false),
+            (serde_json::json!({"text": "lunch?"}), false),
+            (serde_json::json!({"text": "/new"}), true),
+            (serde_json::json!({"text": "/new@acme_bot"}), true),
+            (serde_json::json!({"text": "/new@other_bot"}), false),
+            (
+                serde_json::json!({"caption": "look @acme_bot", "photo": []}),
+                true,
+            ),
+            (
+                serde_json::json!({"text": "Acme, help", "entities": [
+                    {"type": "text_mention", "offset": 0, "length": 4, "user": {"id": 99}}
+                ]}),
+                true,
+            ),
+            (
+                serde_json::json!({"text": "yes", "reply_to_message": {
+                    "message_id": 7, "date": 0, "chat": {"id": -100, "type": "supergroup"},
+                    "from": {"id": 99, "is_bot": true}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"text": "yes", "reply_to_message": {
+                    "message_id": 7, "date": 0, "chat": {"id": -100, "type": "supergroup"},
+                    "from": {"id": 6}}}),
+                false,
+            ),
+        ] {
+            let msg = group(fields.clone());
+            assert_eq!(addressed(&msg, &me), to_bot, "{fields}");
+        }
     }
 
     #[test]
