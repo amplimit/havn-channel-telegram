@@ -736,6 +736,7 @@ pub struct Update {
 #[derive(Debug, Deserialize)]
 pub struct ChatMemberUpdated {
     pub chat: Chat,
+    pub old_chat_member: ChatMember,
     pub new_chat_member: ChatMember,
 }
 
@@ -744,6 +745,9 @@ pub struct ChatMemberUpdated {
 #[derive(Debug, Deserialize)]
 pub struct ChatMember {
     pub status: String,
+    /// For `restricted`: whether they are still in the chat.
+    #[serde(default)]
+    pub is_member: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

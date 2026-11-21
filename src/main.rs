@@ -247,26 +247,23 @@ async fn telegram_inbound_loop(
                 continue;
             }
             next = update.update_id + 1;
-            // A button press (havn issue #203) goes on as the person who
-            // pressed it sending the button's data; Telegram is told it was
-            // taken, and the buttons come off so they are pressed once.
             // The bot's own status in a group changed: added, made an
-            // administrator or not, removed.
+            // administrator or not, removed. Its privacy mode is asked only
+            // when it is added, which is when Telegram fixes it for the group.
             if let Some(change) = update.my_chat_member {
                 if change.chat.kind == "group" || change.chat.kind == "supergroup" {
-                    let member = matches!(
-                        change.new_chat_member.status.as_str(),
-                        "member" | "restricted"
-                    );
-                    let sees_all = if member {
-                        privacy_now(&tg).await
-                    } else {
-                        false
-                    };
-                    note_status(change.chat.id, &change.new_chat_member.status, || sees_all);
+                    let (old, new) = (&change.old_chat_member, &change.new_chat_member);
+                    let added = !in_chat(old)
+                        && in_chat(new)
+                        && !matches!(new.status.as_str(), "creator" | "administrator");
+                    let joined_sees_all = if added { privacy_now(&tg).await } else { false };
+                    note_status(change.chat.id, old, new, || joined_sees_all);
                 }
                 continue;
             }
+            // A button press (havn issue #203) goes on as the person who
+            // pressed it sending the button's data; Telegram is told it was
+            // taken, and the buttons come off so they are pressed once.
             if let Some(vote) = update.poll_answer {
                 let Some(msg) = vote_message(&tg, &vote) else {
                     continue;
@@ -560,13 +557,38 @@ fn long(msg: &telegram::Message) -> bool {
 /// the mode of a group when the bot is added to it.
 static SEES_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Per group, whether the bot sees every message there, where known: from
-/// its privacy mode when it was added, or shown by a message the bot gets
-/// only when it does (as the group's administrator, say).
-static GROUP_SEES_ALL: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, bool>>> =
+/// What is known of the bot in one group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Known {
+    /// Whether it saw every message as it was added (privacy mode off),
+    /// when it was added while the daemon ran.
+    #[serde(default)]
+    joined: Option<bool>,
+    /// An administrator there sees every message.
+    #[serde(default)]
+    admin: bool,
+    /// A message only a bot that sees every message gets came from there
+    /// (since the bot was last made an administrator or not).
+    #[serde(default)]
+    shown: bool,
+}
+
+impl Known {
+    /// Whether the bot sees every message there, where known.
+    fn sees_all(self) -> Option<bool> {
+        if self.admin || self.shown || self.joined == Some(true) {
+            Some(true)
+        } else {
+            self.joined
+        }
+    }
+}
+
+/// What is known of each group, by chat id.
+static GROUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Known>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Groups `GROUP_SEES_ALL` keeps at most.
+/// Groups `GROUPS` keeps at most.
 const GROUPS_KNOWN: usize = 10_000;
 
 /// Note whether `me`, as `getMe` gave it, sees every message in groups;
@@ -584,11 +606,11 @@ const PRIVACY_ADVICE: &str = "in a group the bot gets only commands to it and re
 
 /// Whether the bot sees every message in group `chat_id`, where known.
 fn group_sees_all(chat_id: i64) -> Option<bool> {
-    GROUP_SEES_ALL.lock().ok()?.get(&chat_id).copied()
+    GROUPS.lock().ok()?.get(&chat_id).and_then(|k| k.sees_all())
 }
 
-/// Where `GROUP_SEES_ALL` is kept across restarts, beside the state file:
-/// a group in privacy mode never shows it again.
+/// Where `GROUPS` is kept across restarts, beside the state file: a group
+/// in privacy mode never shows it again.
 static GROUPS_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Keep what is known of the groups beside the state file `state`
@@ -600,17 +622,31 @@ fn keep_groups_beside(state: Option<&std::path::Path>) {
     let mut path = state.as_os_str().to_owned();
     path.push(".groups");
     let path = PathBuf::from(path);
-    let kept: Option<std::collections::HashMap<i64, bool>> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|body| serde_json::from_str(&body).ok());
-    if let (Some(kept), Ok(mut known)) = (kept, GROUP_SEES_ALL.lock()) {
-        *known = kept;
+    match std::fs::read_to_string(&path) {
+        Ok(body) => match serde_json::from_str::<std::collections::HashMap<i64, Known>>(&body) {
+            Ok(kept) => {
+                if let Ok(mut known) = GROUPS.lock() {
+                    *known = kept;
+                }
+            }
+            Err(e) => warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read what was kept of the groups; starting without it"
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            path = %path.display(),
+            error = %e,
+            "could not read what was kept of the groups; starting without it"
+        ),
     }
     let _ = GROUPS_FILE.set(path);
 }
 
 /// Write `known` to `GROUPS_FILE`, the file replaced whole.
-fn save_groups(known: &std::collections::HashMap<i64, bool>) {
+fn save_groups(known: &std::collections::HashMap<i64, Known>) {
     let Some(path) = GROUPS_FILE.get() else {
         return;
     };
@@ -620,7 +656,9 @@ fn save_groups(known: &std::collections::HashMap<i64, bool>) {
     let written = serde_json::to_string(known)
         .map_err(std::io::Error::other)
         .and_then(|body| {
-            std::fs::write(&tmp, body)?;
+            let mut file = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut file, body.as_bytes())?;
+            file.sync_all()?;
             std::fs::rename(&tmp, path)
         });
     if let Err(e) = written {
@@ -628,32 +666,32 @@ fn save_groups(known: &std::collections::HashMap<i64, bool>) {
     }
 }
 
-/// Note that the bot does (or does not) see every message in `chat_id`.
-fn note_group(chat_id: i64, sees_all: bool) {
-    let Ok(mut known) = GROUP_SEES_ALL.lock() else {
+/// Change what is known of `chat_id` by `change` (`None` forgets it), and
+/// keep it when it changed.
+fn change_group(chat_id: i64, change: impl FnOnce(Known) -> Option<Known>) {
+    let Ok(mut known) = GROUPS.lock() else {
         return;
     };
-    if known.get(&chat_id) == Some(&sees_all) {
+    let before = known.get(&chat_id).copied();
+    let after = change(before.unwrap_or_default());
+    if after == before {
         return;
     }
-    if known.len() >= GROUPS_KNOWN && !known.contains_key(&chat_id) {
-        let Some(&any) = known.keys().next() else {
-            return;
-        };
-        known.remove(&any);
+    match after {
+        Some(after) => {
+            if known.len() >= GROUPS_KNOWN
+                && before.is_none()
+                && let Some(&any) = known.keys().next()
+            {
+                known.remove(&any);
+            }
+            known.insert(chat_id, after);
+        }
+        None => {
+            known.remove(&chat_id);
+        }
     }
-    known.insert(chat_id, sees_all);
     save_groups(&known);
-}
-
-/// Forget `chat_id`: the bot left it.
-fn forget_group(chat_id: i64) {
-    let Ok(mut known) = GROUP_SEES_ALL.lock() else {
-        return;
-    };
-    if known.remove(&chat_id).is_some() {
-        save_groups(&known);
-    }
 }
 
 /// How long `getMe` is waited for when the bot joins a group.
@@ -676,23 +714,48 @@ async fn privacy_now(tg: &Telegram) -> bool {
     }
 }
 
-/// Note the bot's new `status` in group `chat_id`, from `my_chat_member`:
-/// an administrator sees every message; a member what its privacy mode
-/// gives (`member_sees_all`), as Telegram fixes it when the bot is added;
-/// one that left is forgotten.
-fn note_status(chat_id: i64, status: &str, member_sees_all: impl FnOnce() -> bool) {
-    match status {
-        "administrator" | "creator" => note_group(chat_id, true),
-        "member" | "restricted" => {
-            let sees_all = member_sees_all();
-            if !sees_all {
-                warn!(chat_id, "in a group in privacy mode: {PRIVACY_ADVICE}");
-            }
-            note_group(chat_id, sees_all);
-        }
-        "left" | "kicked" => forget_group(chat_id),
-        _ => {}
+/// Whether `member` is in the chat: a member, an administrator, or
+/// restricted while still a member.
+fn in_chat(member: &telegram::ChatMember) -> bool {
+    match member.status.as_str() {
+        "creator" | "administrator" | "member" => true,
+        "restricted" => member.is_member.unwrap_or(true),
+        _ => false,
     }
+}
+
+/// Note the bot's change of status in group `chat_id`, from
+/// `my_chat_member`. Added as a member, it sees what its privacy mode gives
+/// then (`joined_sees_all`), as Telegram fixes it for the group; an
+/// administrator sees every message; made one no longer, it goes back to
+/// what it was added with; out of the group, it is forgotten.
+fn note_status(
+    chat_id: i64,
+    old: &telegram::ChatMember,
+    new: &telegram::ChatMember,
+    joined_sees_all: impl FnOnce() -> bool,
+) {
+    if !in_chat(new) {
+        change_group(chat_id, |_| None);
+        return;
+    }
+    let admin = matches!(new.status.as_str(), "creator" | "administrator");
+    let joined = !in_chat(old);
+    let joined_with = (joined && !admin).then(joined_sees_all);
+    if joined_with == Some(false) {
+        warn!(
+            chat_id,
+            "added to a group in privacy mode: {PRIVACY_ADVICE}"
+        );
+    }
+    change_group(chat_id, |known| {
+        Some(Known {
+            joined: if joined { joined_with } else { known.joined },
+            admin,
+            // Shown while an administrator, or before: not since.
+            shown: known.shown && admin == known.admin && !joined,
+        })
+    });
 }
 
 /// Whether `msg` says something: text, a caption, a file, a poll and such,
@@ -735,12 +798,21 @@ fn shows_all_seen(msg: &telegram::Message, me: &telegram::TelegramUser) -> bool 
 fn learn_group(msg: &telegram::Message, me: &telegram::TelegramUser) {
     let chat_id = msg.chat.id;
     if let Some(to) = msg.migrate_to_chat_id {
-        if let Some(sees_all) = group_sees_all(chat_id) {
-            note_group(to, sees_all);
+        let moved = GROUPS
+            .lock()
+            .ok()
+            .and_then(|known| known.get(&chat_id).copied());
+        if let Some(moved) = moved {
+            change_group(to, |_| Some(moved));
         }
-        forget_group(chat_id);
+        change_group(chat_id, |_| None);
     } else if shows_all_seen(msg, me) {
-        note_group(chat_id, true);
+        change_group(chat_id, |known| {
+            Some(Known {
+                shown: true,
+                ..known
+            })
+        });
     }
 }
 
@@ -2136,40 +2208,102 @@ mod tests {
             fields["chat"] = serde_json::json!({"id": chat, "type": "group"});
             message(fields)
         };
-        // Added in privacy mode, then made an administrator, then removed.
-        note_status(-7001, "member", || false);
+        let status = |status: &str| telegram::ChatMember {
+            status: status.into(),
+            is_member: None,
+        };
+        // Added in privacy mode; a command proves nothing.
+        note_status(-7001, &status("left"), &status("member"), || false);
         assert_eq!(group_sees_all(-7001), Some(false));
         learn_group(
             &in_group(-7001, serde_json::json!({"text": "/help@acme_bot"})),
             &me,
         );
-        assert_eq!(
-            group_sees_all(-7001),
-            Some(false),
-            "a command proves nothing"
+        assert_eq!(group_sees_all(-7001), Some(false));
+        // Made an administrator, then no longer: back to what it was added with,
+        // whatever privacy mode is now.
+        note_status(
+            -7001,
+            &status("member"),
+            &status("administrator"),
+            || unreachable!(),
         );
-        note_status(-7001, "administrator", || unreachable!());
         assert_eq!(group_sees_all(-7001), Some(true));
-        note_status(-7001, "left", || unreachable!());
+        learn_group(&in_group(-7001, serde_json::json!({"text": "lunch?"})), &me);
+        note_status(
+            -7001,
+            &status("administrator"),
+            &status("member"),
+            || unreachable!(),
+        );
+        assert_eq!(group_sees_all(-7001), Some(false));
+        // Restricted, still a member: no change; no longer a member: forgotten.
+        note_status(
+            -7001,
+            &status("member"),
+            &status("restricted"),
+            || unreachable!(),
+        );
+        assert_eq!(group_sees_all(-7001), Some(false));
+        let gone = telegram::ChatMember {
+            status: "restricted".into(),
+            is_member: Some(false),
+        };
+        note_status(-7001, &status("restricted"), &gone, || unreachable!());
         assert_eq!(group_sees_all(-7001), None);
         // Added with privacy mode off; the group becomes a supergroup.
-        note_status(-7002, "member", || true);
+        note_status(-7002, &status("left"), &status("member"), || true);
         learn_group(
             &in_group(-7002, serde_json::json!({"migrate_to_chat_id": -1_007_002})),
             &me,
         );
         assert_eq!(group_sees_all(-7002), None);
         assert_eq!(group_sees_all(-1_007_002), Some(true));
+        // Added as an administrator; removed.
+        note_status(
+            -7004,
+            &status("left"),
+            &status("administrator"),
+            || unreachable!(),
+        );
+        assert_eq!(group_sees_all(-7004), Some(true));
+        note_status(
+            -7004,
+            &status("administrator"),
+            &status("kicked"),
+            || unreachable!(),
+        );
+        assert_eq!(group_sees_all(-7004), None);
         // Not known (joined before the daemon), shown by a message only such a bot gets.
         assert_eq!(group_sees_all(-7003), None);
         learn_group(&in_group(-7003, serde_json::json!({"text": "lunch?"})), &me);
         assert_eq!(group_sees_all(-7003), Some(true));
         let change: telegram::ChatMemberUpdated = serde_json::from_value(serde_json::json!({
-            "chat": {"id": -7004, "type": "supergroup"},
-            "new_chat_member": {"status": "member", "user": {"id": 99, "is_bot": true}}
+            "chat": {"id": -7005, "type": "supergroup"},
+            "old_chat_member": {"status": "left", "user": {"id": 99, "is_bot": true}},
+            "new_chat_member": {"status": "restricted", "is_member": true, "user": {"id": 99, "is_bot": true}}
         }))
         .expect("my_chat_member");
-        assert_eq!(change.new_chat_member.status, "member");
+        assert!(!in_chat(&change.old_chat_member) && in_chat(&change.new_chat_member));
+    }
+
+    #[test]
+    fn what_is_known_of_the_groups_is_kept_as_json() {
+        let kept: std::collections::HashMap<i64, Known> = [(
+            -5,
+            Known {
+                joined: Some(false),
+                admin: true,
+                shown: false,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let body = serde_json::to_string(&kept).expect("json");
+        let back: std::collections::HashMap<i64, Known> =
+            serde_json::from_str(&body).expect("back");
+        assert_eq!(back, kept);
+        assert_eq!(back[&-5].sees_all(), Some(true));
     }
 
     #[test]
