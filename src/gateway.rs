@@ -79,6 +79,10 @@ impl Gateway {
         url.query_pairs_mut()
             .append_pair("sender", sender)
             .append_pair("name", name);
+        // In a group the gateway lets the group in (havn issue #263).
+        if let Some(group) = crate::upload_group() {
+            url.query_pairs_mut().append_pair("group", &group);
+        }
         let bytes = bytes::Bytes::from(bytes);
         // The account's uploads at once are few: when they are all
         // running, the file waits a moment. No other refusal passes soon.

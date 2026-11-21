@@ -29,6 +29,11 @@ pub enum ChannelFrame {
 pub struct ChannelCommands {
     pub account_id: String,
     pub commands: Vec<ChannelCommand>,
+    /// The gateway takes group messages (havn issue #263); until one says
+    /// so, they are not passed on, as an older one would take them for
+    /// private ones.
+    #[serde(default)]
+    pub groups: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +57,23 @@ pub struct ChannelInbound {
     /// `POST /api/v1/channel/files` (havn issue #106).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// The group it was sent in (havn issue #263); none in a private chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<ChannelGroup>,
+}
+
+/// The group a message was sent in (havn issue #263).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelGroup {
+    /// `tg:<chat id>`: what replies are sent to.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// To the bot: it names the bot, replies to it, or is a command.
+    #[serde(default)]
+    pub addressed: bool,
 }
 
 /// A file saved in the agent's inbox, as the gateway answered its upload.

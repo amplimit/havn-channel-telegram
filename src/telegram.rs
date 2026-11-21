@@ -383,6 +383,36 @@ impl Telegram {
         }
     }
 
+    /// The bot itself (`getMe`): its id and username, by which a group
+    /// message is known to address it (havn issue #263).
+    pub async fn get_me(&self) -> Result<TelegramUser> {
+        let url = format!("{}/getMe", self.base);
+        let resp: ApiResponse<TelegramUser> = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("getMe request")?
+            .json()
+            .await
+            .context("getMe body parse")?;
+        match (resp.ok, resp.result) {
+            (true, Some(me)) => Ok(me),
+            _ => anyhow::bail!(
+                "telegram getMe returned ok=false: {}",
+                resp.description.unwrap_or_default()
+            ),
+        }
+    }
+
+    /// Whether `e`, from [`Self::get_me`], is Telegram refusing the token,
+    /// which trying again does not mend.
+    pub fn refused_token(e: &anyhow::Error) -> bool {
+        let said = format!("{e:#}");
+        said.contains("Unauthorized") || said.contains("Not Found")
+    }
+
     /// Set the bot's command menu (`setMyCommands`) to `commands`: those
     /// Telegram takes (a name of 1-32 lowercase letters, digits and `_`,
     /// a description of 1-256 characters), at most 100. How many were set.
@@ -806,6 +836,28 @@ pub struct Message {
     /// Where a forwarded message came from.
     #[serde(default)]
     pub forward_origin: Option<MessageOrigin>,
+    /// The chat a message is sent on behalf of: a group's anonymous
+    /// admin, or a channel.
+    #[serde(default)]
+    pub sender_chat: Option<Chat>,
+    /// A channel's post forwarded into its discussion group by Telegram.
+    #[serde(default)]
+    pub is_automatic_forward: bool,
+    /// Mentions, commands and such in `text`, and in `caption`.
+    #[serde(default)]
+    pub entities: Option<Vec<MessageEntity>>,
+    #[serde(default)]
+    pub caption_entities: Option<Vec<MessageEntity>>,
+}
+
+/// Something marked in a message's text; only a mention of a user
+/// without a username (`text_mention`) is read, by whom it names.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MessageEntity {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub user: Option<TelegramUser>,
 }
 
 impl Message {
@@ -840,6 +892,10 @@ impl Message {
             quote: None,
             external_reply: None,
             forward_origin: None,
+            sender_chat: None,
+            is_automatic_forward: false,
+            entities: None,
+            caption_entities: None,
         }
     }
 
@@ -1002,7 +1058,7 @@ pub struct Contact {
     pub vcard: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TelegramUser {
     pub id: i64,
     #[serde(default)]
