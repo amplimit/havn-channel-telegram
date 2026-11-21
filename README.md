@@ -199,11 +199,16 @@ Add the bot to a group, and let the group use it on the gateway: the account's `
 - it replies to one of the bot's messages,
 - or it is a command, with no bot's name or with this bot's (`/new` or `/new@acme_bot`; `/new@other_bot` is not).
 
-The gateway answers only those. The bot's reply goes to the group as a reply to the message that last addressed it there. The daemon asks Telegram who the bot is (`getMe`) when it starts, and waits until it can.
+The gateway answers only those, as a reply to the message it answers. Group messages go on only to a gateway that says it takes them (from Havn 0.2.8): an older one would take them for private messages, so until then they are dropped. The daemon asks Telegram who the bot is (`getMe`) when it starts, and waits until it can; a token Telegram refuses stops it.
+
+- A message that does not address the bot goes on as its text (or a word for what it is, such as «a photo»), without its files, which are not fetched.
+- An album is gathered into one message as in a private chat; texts are not, since texts in a row may be several people's.
+- A message an anonymous admin or a channel sends on behalf of a chat is that chat's: its id and title are the sender's. A channel's post Telegram forwards into its discussion group does not address the bot.
+- The files of a message to the bot are sent for the group, which the gateway lets in instead of the sender.
 
 **Privacy mode.** By default (privacy mode on), Telegram gives a bot in a group only the messages that address it, commands and replies to it: enough to use it. Turn privacy mode off with BotFather (`/setprivacy`, then remove the bot from the group and add it again) for the bot to see the other messages too, which the gateway keeps as context for the next message that addresses it (the last 30). A bot that is a group administrator sees every message whatever the mode.
 
-A typing indicator shows in a group only for a message that addresses the bot.
+No typing indicator shows in a group: a message there may get no reply.
 
 ## Limitations
 

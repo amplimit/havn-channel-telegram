@@ -406,6 +406,13 @@ impl Telegram {
         }
     }
 
+    /// Whether `e`, from [`Self::get_me`], is Telegram refusing the token,
+    /// which trying again does not mend.
+    pub fn refused_token(e: &anyhow::Error) -> bool {
+        let said = format!("{e:#}");
+        said.contains("Unauthorized") || said.contains("Not Found")
+    }
+
     /// Set the bot's command menu (`setMyCommands`) to `commands`: those
     /// Telegram takes (a name of 1-32 lowercase letters, digits and `_`,
     /// a description of 1-256 characters), at most 100. How many were set.
@@ -829,6 +836,13 @@ pub struct Message {
     /// Where a forwarded message came from.
     #[serde(default)]
     pub forward_origin: Option<MessageOrigin>,
+    /// The chat a message is sent on behalf of: a group's anonymous
+    /// admin, or a channel.
+    #[serde(default)]
+    pub sender_chat: Option<Chat>,
+    /// A channel's post forwarded into its discussion group by Telegram.
+    #[serde(default)]
+    pub is_automatic_forward: bool,
     /// Mentions, commands and such in `text`, and in `caption`.
     #[serde(default)]
     pub entities: Option<Vec<MessageEntity>>,
@@ -878,6 +892,8 @@ impl Message {
             quote: None,
             external_reply: None,
             forward_origin: None,
+            sender_chat: None,
+            is_automatic_forward: false,
             entities: None,
             caption_entities: None,
         }

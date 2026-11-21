@@ -29,6 +29,11 @@ pub enum ChannelFrame {
 pub struct ChannelCommands {
     pub account_id: String,
     pub commands: Vec<ChannelCommand>,
+    /// The gateway takes group messages (havn issue #263); until one says
+    /// so, they are not passed on, as an older one would take them for
+    /// private ones.
+    #[serde(default)]
+    pub groups: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
