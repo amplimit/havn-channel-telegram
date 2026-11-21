@@ -75,7 +75,8 @@ impl Telegram {
                 // only in v0.2. Future expansion can widen this.
                 (
                     "allowed_updates",
-                    "[\"message\",\"callback_query\",\"poll_answer\"]".to_string(),
+                    "[\"message\",\"callback_query\",\"poll_answer\",\"my_chat_member\"]"
+                        .to_string(),
                 ),
             ])
             .send()
@@ -708,6 +709,7 @@ fn read_update(value: serde_json::Value) -> Option<Update> {
                 message: None,
                 callback_query: None,
                 poll_answer: None,
+                my_chat_member: None,
             })
         }
     }
@@ -725,6 +727,27 @@ pub struct Update {
     /// A vote in one of the bot's polls.
     #[serde(default)]
     pub poll_answer: Option<PollAnswer>,
+    /// The bot's own status in a chat changed.
+    #[serde(default)]
+    pub my_chat_member: Option<ChatMemberUpdated>,
+}
+
+/// A change of a member's status in a chat (`my_chat_member`: the bot's).
+#[derive(Debug, Deserialize)]
+pub struct ChatMemberUpdated {
+    pub chat: Chat,
+    pub old_chat_member: ChatMember,
+    pub new_chat_member: ChatMember,
+}
+
+/// A member of a chat, with their status: `creator`, `administrator`,
+/// `member`, `restricted`, `left` or `kicked`.
+#[derive(Debug, Deserialize)]
+pub struct ChatMember {
+    pub status: String,
+    /// For `restricted`: whether they are still in the chat.
+    #[serde(default)]
+    pub is_member: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,6 +866,12 @@ pub struct Message {
     /// A channel's post forwarded into its discussion group by Telegram.
     #[serde(default)]
     pub is_automatic_forward: bool,
+    /// The supergroup a group became, in that service message.
+    #[serde(default)]
+    pub migrate_to_chat_id: Option<i64>,
+    /// The bot it was sent via (inline mode).
+    #[serde(default)]
+    pub via_bot: Option<TelegramUser>,
     /// Mentions, commands and such in `text`, and in `caption`.
     #[serde(default)]
     pub entities: Option<Vec<MessageEntity>>,
@@ -894,6 +923,8 @@ impl Message {
             forward_origin: None,
             sender_chat: None,
             is_automatic_forward: false,
+            migrate_to_chat_id: None,
+            via_bot: None,
             entities: None,
             caption_entities: None,
         }
@@ -1069,6 +1100,10 @@ pub struct TelegramUser {
     pub first_name: Option<String>,
     #[serde(default)]
     pub last_name: Option<String>,
+    /// The bot's own (`getMe`): whether it sees every message in groups,
+    /// with privacy mode off.
+    #[serde(default)]
+    pub can_read_all_group_messages: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

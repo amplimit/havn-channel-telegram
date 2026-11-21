@@ -74,6 +74,11 @@ pub struct ChannelGroup {
     /// To the bot: it names the bot, replies to it, or is a command.
     #[serde(default)]
     pub addressed: bool,
+    /// Whether the bot sees every message in the group: not in privacy
+    /// mode, or an administrator there. Otherwise a mention that is not a
+    /// reply never reaches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sees_all: Option<bool>,
 }
 
 /// A file saved in the agent's inbox, as the gateway answered its upload.
