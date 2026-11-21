@@ -199,7 +199,7 @@ Add the bot to a group, and let the group use it on the gateway: the account's `
 - it replies to one of the bot's messages,
 - or it is a command, with no bot's name or with this bot's (`/new` or `/new@acme_bot`; `/new@other_bot` is not).
 
-The gateway answers only those, as a reply to the message it answers. Group messages go on only to a gateway that says it takes them (from Havn 0.2.8): an older one would take them for private messages, so until then they are dropped. The daemon asks Telegram who the bot is (`getMe`) when it starts, and waits until it can; a token Telegram refuses stops it.
+The gateway answers only those, as a reply to the message it answers. Group messages go on only to a gateway that says it takes them (from Havn 0.2.8): an older one would take them for private messages, so until then they are dropped. At start the daemon waits up to 30 seconds for the gateway to say so before it reads any message; after moving the gateway back to an older version, restart the daemon. The daemon asks Telegram who the bot is (`getMe`) when it starts, and waits until it can; a token Telegram refuses stops it.
 
 - A message that does not address the bot goes on as its text (or a word for what it is, such as «a photo»), without its files, which are not fetched.
 - An album is gathered into one message as in a private chat; texts are not, since texts in a row may be several people's.

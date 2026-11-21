@@ -212,6 +212,12 @@ async fn telegram_inbound_loop(
     me: Arc<telegram::TelegramUser>,
 ) -> Result<()> {
     let seq = Arc::new(AtomicU64::new(1));
+    // Group messages read before the gateway says it takes them would be
+    // dropped for good: the first read waits for it, a while.
+    let asked = std::time::Instant::now();
+    while !GATEWAY_SAID.load(Ordering::Relaxed) && asked.elapsed() < GATEWAY_SAYS_WITHIN {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     // The next update not seen yet. Telegram forgets the updates before
     // the offset a poll gives, so while messages are held, polls give the
     // first of them: a restart then gets them again (seen ones are passed
@@ -415,7 +421,7 @@ impl Held {
         // In a group only an album is gathered: texts in a row may be
         // several people's.
         if msg.chat.kind != "private" && msg.media_group_id.is_none() {
-            ready.push(vec![msg]);
+            self.pass(msg, ready);
             return false;
         }
         let chat_id = msg.chat.id;
@@ -525,8 +531,6 @@ fn long(msg: &telegram::Message) -> bool {
         .is_some_and(|t| t.encode_utf16().count() >= TEXT_SPLIT)
 }
 
-/// `msgs`, one message, an album's parts or texts gathered, as one inbound
-/// frame.
 /// The gateway said it takes group messages (havn issue #263).
 static GATEWAY_GROUPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -591,6 +595,16 @@ fn mentions(text: &str, username: &str) -> bool {
     })
 }
 
+/// The gateway's first `Commands` frame came, saying whether it takes
+/// group messages.
+static GATEWAY_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the daemon waits at start for the gateway to say whether it
+/// takes group messages, before it reads any.
+const GATEWAY_SAYS_WITHIN: Duration = Duration::from_secs(30);
+
+/// `msgs`, one message, an album's parts or texts gathered, as one inbound
+/// frame.
 async fn translate(
     msgs: &[telegram::Message],
     tg: &Telegram,
@@ -659,7 +673,7 @@ async fn translate(
             account_id: account_id.to_string(),
             channel_message_id: format!("tg:chat:{}:msg:{}", msg.chat.id, msg.message_id),
             sender_id: format!("tg:{from_id}"),
-            content: ChannelMessageContent::Text { text },
+            content: with_context(ChannelMessageContent::Text { text }, &context_lines(msg)),
             timestamp: chrono::DateTime::from_timestamp(msg.date, 0)
                 .unwrap_or_else(chrono::Utc::now),
             raw: None,
@@ -1486,6 +1500,7 @@ async fn havn_outbound_loop(
         match frame {
             ChannelFrame::Commands(c) => {
                 GATEWAY_GROUPS.store(c.groups, Ordering::Relaxed);
+                GATEWAY_SAID.store(true, Ordering::Relaxed);
                 if menu.as_ref() == Some(&c.commands) {
                     continue;
                 }
