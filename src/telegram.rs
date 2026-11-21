@@ -75,7 +75,8 @@ impl Telegram {
                 // only in v0.2. Future expansion can widen this.
                 (
                     "allowed_updates",
-                    "[\"message\",\"callback_query\",\"poll_answer\"]".to_string(),
+                    "[\"message\",\"callback_query\",\"poll_answer\",\"my_chat_member\"]"
+                        .to_string(),
                 ),
             ])
             .send()
@@ -708,6 +709,7 @@ fn read_update(value: serde_json::Value) -> Option<Update> {
                 message: None,
                 callback_query: None,
                 poll_answer: None,
+                my_chat_member: None,
             })
         }
     }
@@ -725,6 +727,23 @@ pub struct Update {
     /// A vote in one of the bot's polls.
     #[serde(default)]
     pub poll_answer: Option<PollAnswer>,
+    /// The bot's own status in a chat changed.
+    #[serde(default)]
+    pub my_chat_member: Option<ChatMemberUpdated>,
+}
+
+/// A change of a member's status in a chat (`my_chat_member`: the bot's).
+#[derive(Debug, Deserialize)]
+pub struct ChatMemberUpdated {
+    pub chat: Chat,
+    pub new_chat_member: ChatMember,
+}
+
+/// A member of a chat, with their status: `creator`, `administrator`,
+/// `member`, `restricted`, `left` or `kicked`.
+#[derive(Debug, Deserialize)]
+pub struct ChatMember {
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,12 +862,6 @@ pub struct Message {
     /// A channel's post forwarded into its discussion group by Telegram.
     #[serde(default)]
     pub is_automatic_forward: bool,
-    /// Who was added to the group, in that service message.
-    #[serde(default)]
-    pub new_chat_members: Vec<TelegramUser>,
-    /// Who left the group, in that service message.
-    #[serde(default)]
-    pub left_chat_member: Option<TelegramUser>,
     /// The supergroup a group became, in that service message.
     #[serde(default)]
     pub migrate_to_chat_id: Option<i64>,
@@ -906,8 +919,6 @@ impl Message {
             forward_origin: None,
             sender_chat: None,
             is_automatic_forward: false,
-            new_chat_members: Vec::new(),
-            left_chat_member: None,
             migrate_to_chat_id: None,
             via_bot: None,
             entities: None,
