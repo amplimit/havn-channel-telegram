@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
         bot = me.username.as_deref().unwrap_or_default(),
         "telegram bot identified"
     );
+    note_privacy(&me);
     // Voice messages go to the gateway, which transcribes them (havn
     // issue #164).
     if cfg.openai_api_key.is_some() || cfg.whisper_base_url.is_some() || cfg.whisper_model.is_some()
@@ -282,6 +283,17 @@ async fn telegram_inbound_loop(
             // the reply comes (issue #12); only for private chats: a group
             // message may get no reply. What is gathered is
             // one message, with one reply.
+            // Privacy mode changes for a group when the bot is added to
+            // it again, so it is read again then.
+            if msg.new_chat_members.iter().any(|m| m.id == me.id) {
+                let tg = tg.clone();
+                tokio::spawn(async move {
+                    match tg.get_me().await {
+                        Ok(me) => note_privacy(&me),
+                        Err(e) => warn!(error = %e, "telegram getMe failed"),
+                    }
+                });
+            }
             let (chat_id, private) = (msg.chat.id, msg.chat.kind == "private");
             if !held.put(update.update_id, msg, std::time::Instant::now(), &mut ready) && private {
                 typing.start(chat_id);
@@ -531,6 +543,42 @@ fn long(msg: &telegram::Message) -> bool {
         .is_some_and(|t| t.encode_utf16().count() >= TEXT_SPLIT)
 }
 
+/// Whether the bot sees every message in groups: privacy mode off, as
+/// `getMe` last said.
+static SEES_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Groups where the bot was given a message that does not address it, so
+/// it sees every message there (as their administrator) whatever its
+/// privacy mode.
+static SEEN_ALL_IN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Note whether `me`, as `getMe` gave it, sees every message in groups;
+/// warn when it does not, as mentions in groups then never reach it.
+fn note_privacy(me: &telegram::TelegramUser) {
+    let sees_all = me.can_read_all_group_messages.unwrap_or(false);
+    SEES_ALL.store(sees_all, Ordering::Relaxed);
+    if !sees_all {
+        warn!(
+            "privacy mode is on: in a group, the bot gets only commands to it and replies to its messages, \
+             not mentions; turn it off with BotFather (/setprivacy), then remove the bot from each group \
+             and add it again, or make it an administrator there"
+        );
+    }
+}
+
+/// Whether the bot sees every message in the group `chat_id`, given one
+/// that does (`addressed`) or does not address it.
+fn sees_all_in(chat_id: i64, addressed: bool) -> bool {
+    let Ok(mut seen) = SEEN_ALL_IN.lock() else {
+        return SEES_ALL.load(Ordering::Relaxed);
+    };
+    if !addressed {
+        seen.insert(chat_id);
+    }
+    SEES_ALL.load(Ordering::Relaxed) || seen.contains(&chat_id)
+}
+
 /// The gateway said it takes group messages (havn issue #263).
 static GATEWAY_GROUPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -638,6 +686,10 @@ async fn translate(
                     .or_else(|| from.username.clone()),
                 },
                 addressed: msgs.iter().any(|m| addressed(m, me)),
+                sees_all: Some(sees_all_in(
+                    msg.chat.id,
+                    msgs.iter().any(|m| addressed(m, me)),
+                )),
             })
         }
         "group" | "supergroup" => {
@@ -1854,6 +1906,33 @@ mod tests {
             let msg = group(fields.clone());
             assert_eq!(addressed(&msg, &me), to_bot, "{fields}");
         }
+    }
+
+    #[test]
+    fn a_group_says_whether_the_bot_sees_every_message_there() {
+        let me: telegram::TelegramUser = serde_json::from_value(serde_json::json!({
+            "id": 99, "is_bot": true, "username": "acme_bot",
+            "can_read_all_group_messages": false
+        }))
+        .expect("me");
+        note_privacy(&me);
+        assert!(!sees_all_in(-501, true));
+        // Given a message not to it, it sees every message there, as an
+        // administrator.
+        assert!(sees_all_in(-501, false));
+        assert!(sees_all_in(-501, true));
+        assert!(!sees_all_in(-502, true));
+        let added = message(serde_json::json!({
+            "chat": {"id": -502, "type": "group"},
+            "new_chat_members": [{"id": 99, "is_bot": true}]
+        }));
+        assert_eq!(added.new_chat_members[0].id, me.id);
+        let open: telegram::TelegramUser = serde_json::from_value(serde_json::json!({
+            "id": 99, "is_bot": true, "can_read_all_group_messages": true
+        }))
+        .expect("me");
+        note_privacy(&open);
+        assert!(sees_all_in(-502, true));
     }
 
     #[test]

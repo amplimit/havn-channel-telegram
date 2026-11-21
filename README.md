@@ -206,7 +206,9 @@ The gateway answers only those, as a reply to the message it answers. Group mess
 - A message an anonymous admin or a channel sends on behalf of a chat is that chat's: its id and title are the sender's. A channel's post Telegram forwards into its discussion group does not address the bot.
 - The files of a message to the bot are sent for the group, which the gateway lets in instead of the sender.
 
-**Privacy mode.** By default (privacy mode on), Telegram gives a bot in a group only the messages that address it, commands and replies to it: enough to use it. Turn privacy mode off with BotFather (`/setprivacy`, then remove the bot from the group and add it again) for the bot to see the other messages too, which the gateway keeps as context for the next message that addresses it (the last 30). A bot that is a group administrator sees every message whatever the mode.
+**Privacy mode.** It is on by default, and while it is, Telegram gives a bot in a group only commands meant for it (`/help@acme_bot`) and replies to its messages: a mention that is not a reply never reaches it. To mention the bot, turn privacy mode off with BotFather (`/setprivacy`, Disable), then remove the bot from the group and add it again, as Telegram applies the change only then; a group the gateway let in stays let in. The bot then sees the other messages too, which the gateway keeps as context for the next message that addresses it (the last 30). A bot that is a group administrator sees every message whatever the mode.
+
+The daemon reads the mode from `getMe` when it starts, warning in its log while it is on, and again when the bot is added to a group. Each group message says whether the bot sees every message there (`sees_all`): not in privacy mode, or once a message that does not address it has come from that group. While it does not, the gateway's welcome to a group asks members to reply to the bot or send it a command, the owner who lets a group in is told how to turn privacy mode off, and the agent's settings page says so beside its groups.
 
 No typing indicator shows in a group: a message there may get no reply.
 

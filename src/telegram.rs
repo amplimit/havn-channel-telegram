@@ -843,6 +843,9 @@ pub struct Message {
     /// A channel's post forwarded into its discussion group by Telegram.
     #[serde(default)]
     pub is_automatic_forward: bool,
+    /// Who was added to the group, in that service message.
+    #[serde(default)]
+    pub new_chat_members: Vec<TelegramUser>,
     /// Mentions, commands and such in `text`, and in `caption`.
     #[serde(default)]
     pub entities: Option<Vec<MessageEntity>>,
@@ -894,6 +897,7 @@ impl Message {
             forward_origin: None,
             sender_chat: None,
             is_automatic_forward: false,
+            new_chat_members: Vec::new(),
             entities: None,
             caption_entities: None,
         }
@@ -1069,6 +1073,10 @@ pub struct TelegramUser {
     pub first_name: Option<String>,
     #[serde(default)]
     pub last_name: Option<String>,
+    /// The bot's own (`getMe`): whether it sees every message in groups,
+    /// with privacy mode off.
+    #[serde(default)]
+    pub can_read_all_group_messages: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
