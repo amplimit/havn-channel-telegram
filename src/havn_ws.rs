@@ -54,38 +54,71 @@ pub struct WsConfig {
 }
 
 /// Where the daemon is in the gateway's numbering of its replies (issue
-/// #23): the last one it got, to resume from when it reconnects, and the
-/// last one it delivered, kept in a file so a restart resumes from that.
+/// #23): the last one it got, to resume from when it reconnects, and where
+/// a restart resumes from, kept in a file. Replies are delivered by the
+/// worker of their chat, so a later one may be delivered before an earlier
+/// one of a slower chat: the file keeps the last seq up to which every
+/// reply was delivered, and those after it that were, which a restart
+/// does not deliver again (havn issue #325).
 #[derive(Debug)]
 pub struct Delivered {
     path: Option<PathBuf>,
     account_id: String,
     got: Mutex<Option<u64>>,
+    marks: Mutex<Marks>,
     /// A write that failed is said once.
     warned: std::sync::atomic::AtomicBool,
 }
+
+/// What [`Delivered`] knows of the replies it was handed.
+#[derive(Debug, Default)]
+struct Marks {
+    /// Every reply up to it was delivered.
+    upto: Option<u64>,
+    /// Handed to a chat's worker, not delivered yet.
+    waiting: std::collections::BTreeSet<u64>,
+    /// Delivered, past `upto`.
+    done: std::collections::BTreeSet<u64>,
+}
+
+/// Replies past the last seq up to which all were delivered that are kept
+/// as delivered at most; past that, the oldest are let go (a restart would
+/// deliver them again).
+const DONE_KEPT: usize = 1024;
 
 /// What the file holds.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Kept {
     account_id: String,
     seq: u64,
+    /// Replies past `seq` that were delivered. Absent from a file of an
+    /// older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    done: Vec<u64>,
 }
 
 impl Delivered {
     /// The last seq kept at `path` for `account_id`, if any: none for a
     /// file of another account, or none at all (the first run).
     pub fn load(path: Option<PathBuf>, account_id: &str) -> Self {
-        let delivered = path
+        let kept = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<Kept>(&s).ok())
-            .filter(|k| k.account_id == account_id)
-            .map(|k| k.seq);
+            .filter(|k| k.account_id == account_id);
+        let marks = Marks {
+            upto: kept.as_ref().map(|k| k.seq),
+            waiting: std::collections::BTreeSet::new(),
+            done: kept
+                .as_ref()
+                .map(|k| k.done.iter().copied().filter(|s| *s > k.seq).collect())
+                .unwrap_or_default(),
+        };
         Self {
             path,
             account_id: account_id.to_string(),
-            got: Mutex::new(delivered),
+            got: Mutex::new(kept.map(|k| k.seq)),
+            marks: Mutex::new(marks),
             warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -107,6 +140,12 @@ impl Delivered {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
         self.got
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn marks(&self) -> std::sync::MutexGuard<'_, Marks> {
+        self.marks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -138,15 +177,49 @@ impl Delivered {
         *got = Some(seq);
     }
 
+    /// Whether the reply numbered `seq` was delivered already, before a
+    /// restart: one the gateway replays as it resumes from an earlier one,
+    /// not to be delivered again.
+    pub fn delivered_already(&self, seq: u64) -> bool {
+        self.marks().done.contains(&seq)
+    }
+
+    /// The reply numbered `seq` was handed to its chat's worker.
+    pub fn handed(&self, seq: u64) {
+        self.marks().waiting.insert(seq);
+    }
+
     /// The reply numbered `seq` was delivered: kept, the file replaced
     /// whole so a crash leaves the old one or the new one.
     pub fn mark(&self, seq: u64) {
+        let kept = {
+            let mut marks = self.marks();
+            marks.waiting.remove(&seq);
+            marks.done.insert(seq);
+            let last_done = marks.done.last().copied().unwrap_or(seq);
+            let upto = match marks.waiting.first() {
+                Some(first) => first.saturating_sub(1),
+                None => last_done,
+            };
+            // A gateway that numbers from an earlier point is followed, as
+            // `got` does.
+            let upto = match marks.upto {
+                Some(old) if upto < old && !marks.waiting.is_empty() => old,
+                _ => upto,
+            };
+            marks.upto = Some(upto);
+            marks.done.retain(|s| *s > upto);
+            while marks.done.len() > DONE_KEPT {
+                marks.done.pop_first();
+            }
+            Kept {
+                account_id: self.account_id.clone(),
+                seq: upto,
+                done: marks.done.iter().copied().collect(),
+            }
+        };
         let Some(path) = &self.path else {
             return;
-        };
-        let kept = Kept {
-            account_id: self.account_id.clone(),
-            seq,
         };
         let mut tmp = path.clone().into_os_string();
         tmp.push(".tmp");
@@ -401,6 +474,29 @@ mod tests {
         delivered.mark(1);
         assert_eq!(delivered.since(), Some(1));
         assert_eq!(Delivered::load(Some(path), "bot").since(), Some(1));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_reply_of_a_slower_chat_is_resumed_from_and_those_after_it_are_not_sent_again() {
+        let d = dir("chats");
+        let path = Delivered::file_in(&d, "bot");
+        let delivered = Delivered::load(Some(path.clone()), "bot");
+        for seq in [10, 11, 12] {
+            delivered.got(seq);
+            delivered.handed(seq);
+        }
+        // 10 waits in a slow chat while 11 and 12 go in others.
+        delivered.mark(11);
+        delivered.mark(12);
+        let again = Delivered::load(Some(path.clone()), "bot");
+        assert_eq!(again.since(), Some(9), "10 is sent again after a restart");
+        assert!(!again.delivered_already(10));
+        assert!(again.delivered_already(11) && again.delivered_already(12));
+        delivered.mark(10);
+        let again = Delivered::load(Some(path), "bot");
+        assert_eq!(again.since(), Some(12));
+        assert!(!again.delivered_already(11), "nothing past it to skip");
         let _ = std::fs::remove_dir_all(&d);
     }
 
