@@ -11,6 +11,8 @@
 //!   [`Delivered`]): the gateway replays the replies it kept (5 minutes)
 //!   that came after it, before any new one
 //! - heartbeat via `ChannelFrame::Ping` / `Pong`
+//! - `writing=true` in the upgrade: replies come as they are written
+//!   (`ChannelFrame::Writing`, havn issue #325) from a gateway that does so
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -246,10 +248,13 @@ async fn connect(cfg: &WsConfig) -> Result<WebSocketStream<MaybeTlsStream<TcpStr
         .with_context(|| format!("parse havn_gateway URL {:?}", cfg.gateway_url))?;
     // Replace any existing path; spec mandates `/api/v1/channel`.
     url.set_path("/api/v1/channel");
+    // Replies are shown as they are written (havn issue #325): a gateway
+    // that knows it sends them so, an older one ignores it.
     url.query_pairs_mut()
         .clear()
         .append_pair("channel", &cfg.channel_id)
-        .append_pair("account", &cfg.account_id);
+        .append_pair("account", &cfg.account_id)
+        .append_pair("writing", "true");
     // The replies kept for it while it was away come first, before any new
     // one: the gateway starts the replay as it registers the connection.
     if let Some(since) = cfg.delivered.since() {
