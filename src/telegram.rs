@@ -299,7 +299,11 @@ impl Telegram {
                     ))
                     .await;
                 }
-                _ => anyhow::bail!(
+                // Asked still: the caller may wait longer.
+                Some(wait) => {
+                    return Err(SlowDown(wait)).context("telegram sendMessage");
+                }
+                None => anyhow::bail!(
                     "telegram sendMessage returned ok=false: {}",
                     resp.description.unwrap_or_default()
                 ),

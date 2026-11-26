@@ -44,6 +44,12 @@ pub struct ChannelWriting {
     /// The button that stops the reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<Button>>,
+    /// `text` is only the line saying the reply is being written.
+    #[serde(default)]
+    pub waiting: bool,
+    /// Only says the reply is still being written: nothing to show.
+    #[serde(default)]
+    pub alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

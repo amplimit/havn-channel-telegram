@@ -322,31 +322,35 @@ async fn telegram_inbound_loop(
 /// Button press `press` as the message it sends, from the person who
 /// pressed it, and whether it is a Stop button (havn issue #325). The
 /// press is answered, and the buttons come off so they are pressed once.
-/// A Stop button is `/stop` while its reply is being written, once, and
-/// sends nothing after.
+/// A Stop button is `/stop` while its reply is being written, and keeps
+/// its place until the reply ends, as the gateway may not let the person
+/// stop it; the same person's presses in [`PRESS_AGAIN_AFTER`] send it
+/// once. Pressed once its reply ended, it sends nothing and comes off.
 fn pressed(tg: &Telegram, press: telegram::CallbackQuery) -> Option<(telegram::Message, bool)> {
-    let pressed = press.as_message();
+    let mut msg = press.as_message();
+    let stop = msg
+        .as_ref()
+        .and_then(|m| m.text.as_deref())
+        .and_then(|t| t.strip_prefix(STOP_PREFIX))
+        .map(|reply| stop_pressed(reply, press.from.id));
     let tg = tg.clone();
     let under = press.message.as_ref().map(|m| (m.chat.id, m.message_id));
+    let keep = stop.is_some_and(|p| p != Press::Spent);
     tokio::spawn(async move {
         tg.answer_press(&press.id).await;
-        if let Some((chat_id, message_id)) = under {
+        if let Some((chat_id, message_id)) = under.filter(|_| !keep) {
             tg.clear_buttons(chat_id, message_id).await;
         }
     });
-    let mut msg = pressed?;
-    let Some(reply) = msg
-        .text
-        .as_deref()
-        .and_then(|t| t.strip_prefix(STOP_PREFIX))
-    else {
-        return Some((msg, false));
-    };
-    if !stop_pressed(reply) {
-        return None;
+    match stop {
+        None => Some((msg?, false)),
+        Some(Press::Stop) => {
+            let mut msg = msg.take()?;
+            msg.text = Some("/stop".into());
+            Some((msg, true))
+        }
+        Some(Press::Again | Press::Spent) => None,
     }
-    msg.text = Some("/stop".into());
-    Some((msg, true))
 }
 
 /// A getUpdates call in flight, and when it was asked.
@@ -2099,42 +2103,66 @@ const LIVE_GROUP_EVERY: Duration = Duration::from_secs(5);
 const LIVE_KEPT: usize = 256;
 /// A reply being written that gets nothing for this long is finished as
 /// it is, its Stop button taken off: the agent or the gateway went away
-/// before its end. `/stop` still stops it. As long as the typing indicator
-/// shows.
-const LIVE_IDLE: Duration = TYPING_FOR;
+/// before its end. The gateway says every minute that a reply is still
+/// being written, so this does not come while its turn runs.
+const LIVE_IDLE: Duration = Duration::from_secs(180);
 /// How often replies being written are looked at for [`LIVE_IDLE`].
 const LIVE_IDLE_EVERY: Duration = Duration::from_secs(30);
 /// Replies that ended, remembered so a frame of one that comes late shows
 /// nothing.
 const ENDED_KEPT: usize = 256;
+/// How long the end of a reply, or a part of it, waits at most for Telegram
+/// to let the bot write again, when it asks the bot to slow down.
+const SLOW_DOWN_FOR: Duration = Duration::from_secs(300);
 /// How a Stop button names its reply: this and the reply's id.
 const STOP_PREFIX: &str = "stop#";
+/// A person's presses of a Stop button within this send `/stop` once.
+const PRESS_AGAIN_AFTER: Duration = Duration::from_secs(5);
 
 /// The Stop buttons of the replies being written (havn issue #325), by
-/// reply: whether each was pressed. A press of one whose reply is no longer
-/// written stops nothing.
-static STOPS: std::sync::LazyLock<Mutex<HashMap<String, bool>>> =
+/// reply: when each person last pressed it. A press of one whose reply is
+/// no longer written stops nothing.
+static STOPS: std::sync::LazyLock<Mutex<HashMap<String, HashMap<i64, std::time::Instant>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn stops() -> std::sync::MutexGuard<'static, HashMap<String, bool>> {
+fn stops() -> std::sync::MutexGuard<'static, HashMap<String, HashMap<i64, std::time::Instant>>> {
     STOPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A Stop button of reply `reply` was pressed: whether that stops it,
-/// which it does once, while the reply is being written.
-fn stop_pressed(reply: &str) -> bool {
-    stops()
-        .get_mut(reply)
-        .is_some_and(|pressed| !std::mem::replace(pressed, true))
+/// What a press of a Stop button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Press {
+    /// Sends `/stop` from the person who pressed it.
+    Stop,
+    /// Nothing: the same person pressed it a moment ago.
+    Again,
+    /// Nothing, and the button comes off: its reply is no longer written.
+    Spent,
+}
+
+/// Person `person` pressed a Stop button of reply `reply`.
+fn stop_pressed(reply: &str, person: i64) -> Press {
+    let mut stops = stops();
+    let Some(pressed) = stops.get_mut(reply) else {
+        return Press::Spent;
+    };
+    let now = std::time::Instant::now();
+    if pressed
+        .get(&person)
+        .is_some_and(|at| now.duration_since(*at) < PRESS_AGAIN_AFTER)
+    {
+        return Press::Again;
+    }
+    pressed.insert(person, now);
+    Press::Stop
 }
 
 /// The buttons reply `reply` shows of `given`: the gateway's Stop button
-/// (`/stop`) naming the reply; none once it was pressed, or when the reply
-/// is not being written.
+/// (`/stop`) naming the reply; none when the reply is not being written.
 fn live_buttons(reply: &str, given: &[Vec<types::Button>]) -> Vec<Vec<types::Button>> {
-    if stops().get(reply).is_none_or(|pressed| *pressed) {
+    if !stops().contains_key(reply) {
         return Vec::new();
     }
     given
@@ -2252,6 +2280,8 @@ struct Written {
     buttons: Vec<Vec<types::Button>>,
     /// Telegram refused its formatting: it is shown as plain text.
     plain: bool,
+    /// It shows only the gateway's line saying the reply is being written.
+    waiting: bool,
 }
 
 impl Written {
@@ -2263,6 +2293,7 @@ impl Written {
             messages: Vec::new(),
             buttons: Vec::new(),
             plain: false,
+            waiting: false,
         }
     }
 
@@ -2347,9 +2378,10 @@ impl Written {
         Ok(())
     }
 
-    /// The `n`th of `pieces` could not be put in its message: that message
-    /// and those after it go, and those pieces go in new messages, as a
-    /// reply is sent.
+    /// The `n`th of `pieces` could not be put in its message: those pieces
+    /// go in new messages, as a reply is sent, and then that message and
+    /// those after it go. When the new ones cannot be sent, the old ones
+    /// stay, without their buttons.
     async fn fall_back(
         &mut self,
         tg: &Telegram,
@@ -2360,31 +2392,44 @@ impl Written {
         warn!(
             "telegram: a reply could not be shown in the messages it was being written in; sending the rest anew"
         );
-        let gone: Vec<Shown> = self.messages.drain(n.min(self.messages.len())..).collect();
-        for old in gone.iter().rev() {
-            tg.delete_message(self.chat_id, old.id).await;
-        }
+        let n = n.min(self.messages.len());
         let under = !buttons.is_empty();
+        let mut sent = Vec::new();
         for (k, piece) in pieces.iter().enumerate().skip(n) {
             let with = under && k + 1 == pieces.len();
             let kept = if with { buttons } else { &[] };
             match self.put(tg, None, k, piece, kept, true).await {
-                Ok(id) => self.messages.push(Shown {
+                Ok(id) => sent.push(Shown {
                     id,
                     piece: piece.clone(),
                     buttons: with,
                 }),
                 Err(e) => {
                     warn!(error = %format!("{e:#}"), "telegram: a reply could not be sent");
+                    // What was sent goes after what stays.
+                    self.messages.extend(sent);
+                    for old in &self.messages[..] {
+                        if old.buttons {
+                            tg.clear_buttons(self.chat_id, old.id).await;
+                        }
+                    }
+                    for old in &mut self.messages {
+                        old.buttons = false;
+                    }
                     return;
                 }
             }
         }
+        let gone: Vec<Shown> = self.messages.drain(n..).collect();
+        for old in gone.iter().rev() {
+            tg.delete_message(self.chat_id, old.id).await;
+        }
+        self.messages.extend(sent);
     }
 
     /// `piece` in message `id`, or in a new message (the `n`th) when none;
-    /// its id. When `patient`, again after the wait when Telegram asks the
-    /// bot to slow down (3 tries in all).
+    /// its id. When `patient`, again after each wait Telegram asks for when
+    /// it asks the bot to slow down, for [`SLOW_DOWN_FOR`] at most.
     async fn put(
         &self,
         tg: &Telegram,
@@ -2395,9 +2440,8 @@ impl Written {
         patient: bool,
     ) -> Result<i64> {
         let reply_to = if n == 0 { self.reply_to } else { None };
-        let mut tries = 0;
+        let until = tokio::time::Instant::now() + SLOW_DOWN_FOR;
         loop {
-            tries += 1;
             let put = match id {
                 Some(id) => tg
                     .edit_message(self.chat_id, id, &piece.text, piece.html, buttons)
@@ -2409,7 +2453,9 @@ impl Written {
                 }
             };
             match put.as_ref().err().and_then(telegram::slow_down) {
-                Some(wait) if patient && tries < 3 => tokio::time::sleep(wait).await,
+                Some(wait) if patient && tokio::time::Instant::now() + wait <= until => {
+                    tokio::time::sleep(wait).await;
+                }
                 _ => return put,
             }
         }
@@ -2433,8 +2479,9 @@ impl Written {
     }
 }
 
-/// What a reply being written is to show: its text and its buttons.
-type Showing = (String, Vec<Vec<types::Button>>);
+/// What a reply being written is to show: its text, its buttons, and
+/// whether the text is only the gateway's line saying it is being written.
+type Showing = (String, Vec<Vec<types::Button>>, bool);
 
 /// Edit `written` to show what `rx` is given, at most every
 /// [`LIVE_EVERY`] ([`LIVE_GROUP_EVERY`] in a group), until its sender
@@ -2450,8 +2497,9 @@ async fn write_live(
         LIVE_EVERY
     };
     loop {
-        let (text, buttons) = rx.borrow_and_update().clone();
+        let (text, buttons, waiting) = rx.borrow_and_update().clone();
         written.buttons = buttons;
+        written.waiting = waiting;
         let pause = match written.show(&tg, &text, true, false).await {
             Err(Missed::Wait(wait)) => wait.max(every),
             _ => every,
@@ -2538,10 +2586,15 @@ impl Replies {
         }
     }
 
-    /// Finish `reply` as it is shown: its buttons come off, its text stays.
+    /// Finish `reply` as it is shown: its buttons come off, its text stays;
+    /// a message saying only that it is being written goes.
     async fn finish(&mut self, tg: &Telegram, reply: String, live: Live) {
         if let Some(mut written) = live.written().await {
-            written.drop_buttons(tg).await;
+            if written.waiting {
+                let _ = written.show(tg, "", false, true).await;
+            } else {
+                written.drop_buttons(tg).await;
+            }
         }
         self.end(reply);
     }
@@ -2565,6 +2618,8 @@ impl Replies {
 
     /// Show `w`: in its reply's messages, or in new ones (below a part of
     /// it shown, which loses its buttons); nothing for a reply that ended.
+    /// One that only says the reply is still being written shows nothing,
+    /// and keeps it.
     async fn writing(&mut self, tg: &Telegram, w: types::ChannelWriting) {
         if self.ended.contains(&w.reply) {
             return;
@@ -2572,7 +2627,13 @@ impl Replies {
         let Some(chat_id) = chat_of(&w.to) else {
             return;
         };
-        let showing = (w.text, w.buttons);
+        if w.alive {
+            if let Some((_, seen)) = self.live.get_mut(&w.reply) {
+                *seen = tokio::time::Instant::now();
+            }
+            return;
+        }
+        let showing = (w.text, w.buttons, w.waiting);
         if let Some((Live::Writing { tx, .. }, seen)) = self.live.get_mut(&w.reply) {
             let _ = tx.send(showing);
             *seen = tokio::time::Instant::now();
@@ -2585,7 +2646,7 @@ impl Replies {
             let reply_to = w.in_reply_to.as_deref().and_then(parse_message_id);
             Written::new(&w.reply, chat_id, reply_to)
         };
-        stops().entry(w.reply.clone()).or_insert(false);
+        stops().entry(w.reply.clone()).or_default();
         let (tx, rx) = tokio::sync::watch::channel(showing);
         let task = tokio::spawn(write_live(tg.clone(), written, rx));
         self.put(tg, w.reply, Live::Writing { tx, task }).await;
@@ -2621,6 +2682,7 @@ impl Replies {
             written = below;
         }
         let _ = written.show(tg, text, o.partial, true).await;
+        written.waiting = false;
         if o.partial {
             self.put(tg, reply.clone(), Live::Part(written)).await;
         } else {
@@ -2629,6 +2691,7 @@ impl Replies {
         true
     }
 }
+
 #[cfg(test)]
 mod failure_tests {
     use super::*;
@@ -3404,7 +3467,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_button_stops_its_reply_once_and_only_while_it_is_written() {
+    fn a_stop_button_stops_its_reply_only_while_it_is_written() {
         let given = vec![vec![types::Button {
             label: "Stop".into(),
             data: "/stop".into(),
@@ -3413,17 +3476,21 @@ mod tests {
             live_buttons("r-before", &given).is_empty(),
             "no reply written"
         );
-        stops().insert("r1".into(), false);
+        stops().insert("r1".into(), HashMap::new());
         let shown = live_buttons("r1", &given);
         assert_eq!(shown[0][0].data, "stop#r1");
         assert_eq!(shown[0][0].label, "Stop");
-        assert!(stop_pressed("r1"));
-        assert!(!stop_pressed("r1"), "once");
-        assert!(live_buttons("r1", &given).is_empty(), "not shown again");
+        // Each person may press it; the same person's second press in a
+        // moment sends nothing more. It stays while the reply is written.
+        assert_eq!(stop_pressed("r1", 7), Press::Stop);
+        assert_eq!(stop_pressed("r1", 7), Press::Again);
+        assert_eq!(stop_pressed("r1", 8), Press::Stop);
+        assert_eq!(live_buttons("r1", &given), shown, "the button stays");
         let mut replies = Replies::default();
         replies.end("r1".into());
-        assert!(!stop_pressed("r1"));
-        assert!(!stop_pressed("r-unknown"));
+        assert_eq!(stop_pressed("r1", 9), Press::Spent);
+        assert_eq!(stop_pressed("r-unknown", 7), Press::Spent);
+        assert!(live_buttons("r1", &given).is_empty());
         assert!(replies.ended.contains(&"r1".to_string()));
         for n in 0..ENDED_KEPT + 5 {
             replies.end(format!("e{n}"));
