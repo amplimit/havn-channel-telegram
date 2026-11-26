@@ -294,7 +294,11 @@ async fn telegram_inbound_loop(
                 learn_group(&msg, &me);
             }
             let (chat_id, private) = (msg.chat.id, msg.chat.kind == "private");
-            if !held.put(update.update_id, msg, std::time::Instant::now(), &mut ready) && private {
+            let stop = msg.text.as_deref().is_some_and(is_stop);
+            if !held.put(update.update_id, msg, std::time::Instant::now(), &mut ready)
+                && private
+                && !stop
+            {
                 typing.start(chat_id);
             }
         }
@@ -556,6 +560,25 @@ impl Held {
         self.waiting = kept;
         taken.into_iter().map(|h| h.parts).collect()
     }
+}
+
+/// Whether `text` is `/stop` as the gateway takes it (`/stop`, `/STOP`,
+/// `/stop@bot`), with nothing after it: it stops a reply and gets none of
+/// its own, so no typing indicator shows for it.
+fn is_stop(text: &str) -> bool {
+    let Some(head) = text.trim().strip_prefix('/') else {
+        return false;
+    };
+    let name = match head.split_once('@') {
+        Some((name, bot))
+            if !bot.is_empty() && bot.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+        {
+            name
+        }
+        Some(_) => return false,
+        None => head,
+    };
+    name.eq_ignore_ascii_case("stop")
 }
 
 /// Whether `msg` is a command (`/name` or `/name@bot`, then anything),
@@ -3935,6 +3958,32 @@ mod tests {
             "another for the next"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_typed_stop_is_told_apart_as_the_gateway_takes_it() {
+        for stop in [
+            "/stop",
+            " /stop ",
+            "/STOP",
+            "/Stop@acme_bot",
+            "/stop@Acme_Bot",
+        ] {
+            assert!(is_stop(stop), "{stop}");
+        }
+        // Not a stop, or one the gateway answers (it takes nothing after it).
+        for other in [
+            "stop",
+            "/stopped",
+            "/stop now",
+            "/stop@",
+            "/stop@a-b",
+            "/new",
+            "/ stop",
+            "",
+        ] {
+            assert!(!is_stop(other), "{other}");
+        }
     }
 
     #[test]
