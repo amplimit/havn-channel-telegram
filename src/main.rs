@@ -2669,12 +2669,24 @@ struct Pending {
     writings: HashMap<(String, u64), (u64, types::ChannelWriting)>,
     /// The parts of each reply being written that wait.
     parts: HashMap<String, u64>,
+    /// The bytes of `outbounds`, about.
+    bytes: usize,
+    /// Replies were left out since the backlog began: said once.
+    full: bool,
 }
 
+/// Replies a chat's inbox holds at most, by number and by bytes (havn
+/// issue #325). Past them, as when the platform keeps a slowed chat
+/// behind what an agent sends it, the newest are left out (and marked
+/// handled), so one chat cannot take the memory of a daemon that serves
+/// every one.
+const CHAT_OUTBOUNDS: usize = 256;
+const CHAT_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
+
 /// A chat's frames on their way to its worker (havn issue #325). The router
-/// only adds to it, and never waits: the gateway bounds what it sends ahead
-/// of what the adapter took, and frames of replies being written take the
-/// place of their earlier ones.
+/// only adds to it, and never waits: replies wait in it up to
+/// [`CHAT_OUTBOUNDS`] and [`CHAT_OUTBOUND_BYTES`], and frames of replies
+/// being written take the place of their earlier ones.
 #[derive(Default)]
 struct Inbox {
     pending: Mutex<Pending>,
@@ -2688,9 +2700,25 @@ impl Inbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn outbound(&self, o: ChannelOutbound) {
+    /// Add `o`; whether it was, which it is not past [`CHAT_OUTBOUNDS`] or
+    /// [`CHAT_OUTBOUND_BYTES`].
+    fn outbound(&self, o: ChannelOutbound) -> bool {
         {
             let mut pending = self.pending();
+            let size = serde_json::to_vec(&o).map_or(0, |b| b.len());
+            if pending.outbounds.len() >= CHAT_OUTBOUNDS
+                || pending.bytes + size > CHAT_OUTBOUND_BYTES
+            {
+                if !std::mem::replace(&mut pending.full, true) {
+                    warn!(
+                        held = pending.outbounds.len(),
+                        bytes = pending.bytes,
+                        "telegram: a chat holds as many replies as it may; leaving out the newest until it catches up"
+                    );
+                }
+                return false;
+            }
+            pending.bytes += size;
             let n = pending.next;
             pending.next += 1;
             if let Some(reply) = &o.reply {
@@ -2703,6 +2731,7 @@ impl Inbox {
             pending.outbounds.push_back((n, Box::new(o)));
         }
         self.added.notify_one();
+        true
     }
 
     fn writing(&self, w: types::ChannelWriting) {
@@ -2743,7 +2772,16 @@ impl Inbox {
             (Some((key, w)), o) if o.is_none_or(|o| w < o) => {
                 pending.writings.remove(&key).map(|(_, w)| Job::Writing(w))
             }
-            (_, Some(_)) => pending.outbounds.pop_front().map(|(_, o)| Job::Outbound(o)),
+            (_, Some(_)) => {
+                let (_, o) = pending.outbounds.pop_front()?;
+                let size = serde_json::to_vec(&o).map_or(0, |b| b.len());
+                pending.bytes = pending.bytes.saturating_sub(size);
+                if pending.outbounds.is_empty() {
+                    pending.bytes = 0;
+                    pending.full = false;
+                }
+                Some(Job::Outbound(o))
+            }
             _ => None,
         }
     }
@@ -2921,7 +2959,13 @@ impl Chats {
             return;
         };
         self.delivered.handed(o.seq);
-        self.add(chat_id, |inbox| inbox.outbound(o));
+        let seq = o.seq;
+        let mut kept = false;
+        self.add(chat_id, |inbox| kept = inbox.outbound(o));
+        // Left out: it is not to be delivered after a restart either.
+        if !kept {
+            self.delivered.mark(seq);
+        }
     }
 
     /// Hand `w` to its chat's worker, in the place of the reply's earlier
@@ -3807,6 +3851,39 @@ mod tests {
             .collect();
         assert_eq!(taken, ["o:1", "w:ab", "o:2", "w:cd", "o:3"]);
         assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn a_chat_inbox_leaves_out_the_newest_past_its_cap_and_says_so_once() {
+        let outbound = |seq: u64, text: String| ChannelOutbound {
+            seq,
+            account_id: "a".into(),
+            to: "tg:1".into(),
+            in_reply_to: None,
+            content: ChannelMessageContent::Text { text },
+            buttons: Vec::new(),
+            poll: None,
+            partial: false,
+            reply: None,
+        };
+        let inbox = Inbox::default();
+        for seq in 0..CHAT_OUTBOUNDS as u64 {
+            assert!(inbox.outbound(outbound(seq, "x".into())));
+        }
+        assert!(!inbox.outbound(outbound(999, "x".into())), "past the count");
+        assert!(inbox.pending().full, "said");
+        // Taken, there is room again; the backlog is not said again.
+        assert!(matches!(inbox.take(), Some(Job::Outbound(o)) if o.seq == 0));
+        assert!(inbox.outbound(outbound(1000, "x".into())));
+        assert!(inbox.pending().full);
+        while inbox.take().is_some() {}
+        assert!(!inbox.pending().full, "a new backlog is said again");
+        assert_eq!(inbox.pending().bytes, 0);
+        // By bytes too.
+        let big = "y".repeat(CHAT_OUTBOUND_BYTES / 2);
+        assert!(inbox.outbound(outbound(1, big.clone())));
+        assert!(!inbox.outbound(outbound(2, big)), "past the bytes");
+        assert!(inbox.outbound(outbound(3, "x".into())), "a small one fits");
     }
 
     #[tokio::test(start_paused = true)]
