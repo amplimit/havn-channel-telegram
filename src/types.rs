@@ -23,6 +23,33 @@ pub enum ChannelFrame {
     /// Gateway -> adapter: the chat commands the gateway answers, for
     /// the bot's command menu.
     Commands(ChannelCommands),
+    /// Gateway -> adapter, asked for with `writing=true` on the upgrade
+    /// (havn issue #325): a reply as it is being written.
+    Writing(ChannelWriting),
+}
+
+/// A reply as it is being written: shown in a message edited as it
+/// comes, until an outbound naming the same `reply` takes its place.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelWriting {
+    pub account_id: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// Which reply it is.
+    pub reply: String,
+    /// What the model call in progress wrote so far, or a line saying the
+    /// reply is being written.
+    pub text: String,
+    /// The button that stops the reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<Vec<Button>>,
+    /// `text` is only the line saying the reply is being written.
+    #[serde(default)]
+    pub waiting: bool,
+    /// Only says the reply is still being written: nothing to show.
+    #[serde(default)]
+    pub alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +143,10 @@ pub struct ChannelOutbound {
     /// is still working.
     #[serde(default)]
     pub partial: bool,
+    /// The reply being written this is a part of (with `partial`) or the
+    /// end of (havn issue #325): it takes the place of what was shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
 }
 
 /// A question of several answers.

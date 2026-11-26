@@ -1,7 +1,8 @@
 //! Thin Telegram Bot API client — only the endpoints this adapter
 //! needs: `getUpdates` (long-poll inbound), `getFile` and the file
 //! download (voice, photos, documents), `sendMessage`, `sendDocument`,
-//! `sendPhoto` and `sendAnimation` (deliver outbound), and
+//! `sendPhoto` and `sendAnimation` (deliver outbound), `editMessageText`
+//! and `deleteMessage` (a reply shown as it is written), and
 //! `sendChatAction` (typing indicator).
 //!
 //! Reference: <https://core.telegram.org/bots/api>. Bot tokens look
@@ -239,7 +240,7 @@ impl Telegram {
 
     /// Send a text message, in HTML when `html`. `reply_to_message_id`
     /// threads under the original (Telegram-side equivalent of
-    /// `in_reply_to`).
+    /// `in_reply_to`). Its message id.
     pub async fn send_message(
         &self,
         chat_id: i64,
@@ -247,7 +248,7 @@ impl Telegram {
         html: bool,
         reply_to_message_id: Option<i64>,
         buttons: &[Vec<crate::types::Button>],
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let url = format!("{}/sendMessage", self.base);
         let mut body = serde_json::json!({
             "chat_id": chat_id,
@@ -280,7 +281,12 @@ impl Telegram {
                 .await
                 .context("sendMessage body parse")?;
             if resp.ok {
-                return Ok(());
+                return resp
+                    .result
+                    .as_ref()
+                    .and_then(|m| m.get("message_id"))
+                    .and_then(serde_json::Value::as_i64)
+                    .context("sendMessage without a message id");
             }
             match resp.parameters.and_then(|p| p.retry_after) {
                 Some(wait) if tried < SEND_TRIES => {
@@ -293,7 +299,11 @@ impl Telegram {
                     ))
                     .await;
                 }
-                _ => anyhow::bail!(
+                // Asked still: the caller may wait longer.
+                Some(wait) => {
+                    return Err(SlowDown(wait)).context("telegram sendMessage");
+                }
+                None => anyhow::bail!(
                     "telegram sendMessage returned ok=false: {}",
                     resp.description.unwrap_or_default()
                 ),
@@ -381,6 +391,58 @@ impl Telegram {
         });
         if let Err(e) = self.http.post(&url).json(&body).send().await {
             tracing::debug!(error = %e.without_url(), "editMessageReplyMarkup failed (non-fatal)");
+        }
+    }
+
+    /// Show `text` in message `message_id` instead, in HTML when `html`,
+    /// with `buttons` under it (none takes them off). A message that shows
+    /// it already is no failure. When Telegram asks the bot to slow down,
+    /// the wait it asks for, as the error.
+    pub async fn edit_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        html: bool,
+        buttons: &[Vec<crate::types::Button>],
+    ) -> Result<()> {
+        let url = format!("{}/editMessageText", self.base);
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": keyboard(buttons),
+        });
+        if html {
+            body["parse_mode"] = serde_json::json!("HTML");
+        }
+        let resp: ApiResponse<serde_json::Value> = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("editMessageText request")?
+            .json()
+            .await
+            .context("editMessageText body parse")?;
+        let said = resp.description.unwrap_or_default();
+        if resp.ok || said.contains("message is not modified") {
+            return Ok(());
+        }
+        match resp.parameters.and_then(|p| p.retry_after) {
+            Some(wait) => Err(SlowDown(wait)).context("telegram editMessageText"),
+            None => anyhow::bail!("telegram editMessageText returned ok=false: {said}"),
+        }
+    }
+
+    /// Delete the bot's message `message_id`. Best-effort.
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) {
+        let url = format!("{}/deleteMessage", self.base);
+        let body = serde_json::json!({ "chat_id": chat_id, "message_id": message_id });
+        if let Err(e) = self.http.post(&url).json(&body).send().await {
+            tracing::debug!(error = %e.without_url(), "deleteMessage failed (non-fatal)");
         }
     }
 
@@ -552,6 +614,25 @@ pub fn refused_markup(e: &anyhow::Error) -> bool {
 /// failed on the way, which it may have taken.
 pub fn refused(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("returned ok=false")
+}
+
+/// Telegram asked the bot to slow down: the seconds it asked it to wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowDown(pub u64);
+
+impl std::fmt::Display for SlowDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "asked to wait {} s", self.0)
+    }
+}
+
+impl std::error::Error for SlowDown {}
+
+/// How long Telegram asked to wait, when `e` is it asking the bot to slow
+/// down, at most [`MAX_RETRY_AFTER_SECONDS`].
+pub fn slow_down(e: &anyhow::Error) -> Option<std::time::Duration> {
+    e.downcast_ref::<SlowDown>()
+        .map(|w| std::time::Duration::from_secs(w.0.min(MAX_RETRY_AFTER_SECONDS)))
 }
 
 /// How a file goes to Telegram (issue #15): an image it can show as a
